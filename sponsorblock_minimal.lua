@@ -1,4 +1,5 @@
--- sponsorblock_minimal.lua
+-- sponsorblock_minimal.lua 
+-- source: https://codeberg.org/jouni/mpv_sponsorblock_minimal
 --
 -- This script skips sponsored segments of YouTube videos
 -- using data from https://github.com/ajayyy/SponsorBlock
