@@ -1,11 +1,11 @@
--- sponsorblock_minimal.lua 
--- source: https://codeberg.org/jouni/mpv_sponsorblock_minimal
+-- sponsorblock_minimal.lua
 --
 -- This script skips sponsored segments of YouTube videos
 -- using data from https://github.com/ajayyy/SponsorBlock
 
 local opt = require 'mp.options'
 local utils = require 'mp.utils'
+local msg = require 'mp.msg'
 
 local ON = false
 local ranges = nil
@@ -13,11 +13,13 @@ local ranges = nil
 local options = {
 	server = "https://sponsor.ajay.app/api/skipSegments",
 
-	-- Categories to fetch and skip
-	categories = '"sponsor"',
+	-- Categories to fetch and skip types are [sponsor selfpromo interaction intro outro preview music_offtopic]
+	categories = '"sponsor","selfpromo"',
 
 	-- Set this to "true" to use sha256HashPrefix instead of videoID
-	hash = ""
+	hash = "",
+	-- suration the osd message shows up
+	show_msg = 3
 }
 
 opt.read_options(options)
@@ -29,7 +31,7 @@ function skip_ads(name,pos)
 			if i.segment[1] <= pos and v > pos then
 				--this message may sometimes be wrong
 				--it only seems to be a visual thing though
-				mp.osd_message(("[sponsorblock] skipping forward %ds"):format(math.floor(v-mp.get_property("time-pos"))))
+				mp.osd_message(("[sponsorblock] skipping forward %ds"):format(math.floor(v-mp.get_property("time-pos"))), options.show_msg)
 				--need to do the +0.01 otherwise mpv will start spamming skip sometimes
 				--example: https://www.youtube.com/watch?v=4ypMJzeNooo
 				mp.set_property("time-pos",v+0.01)
@@ -38,6 +40,8 @@ function skip_ads(name,pos)
 		end
 	end
 end
+
+
 
 function file_loaded()
 	local video_path = mp.get_property("path", "")
@@ -87,6 +91,7 @@ function file_loaded()
 	}
 	if sponsors.stdout then
 		local json = utils.parse_json(sponsors.stdout)
+
 		if type(json) == "table" then
 			if options.hash == "true" then
 				for _, i in pairs(json) do
@@ -99,9 +104,32 @@ function file_loaded()
 				ranges = json
 			end
 
+			--sponsorskip segments into chapters and color ranges
 			if ranges then
+
+				for _, i in pairs(ranges) do
+
+
+					msg.info("ranges: " .. utils.to_string(i.segment))
+					msg.info("category: " .. i.category)
+
+					local chapter_list = mp.get_property_native("chapter-list")
+				
+					local chapter_index = (mp.get_property_number("chapter") or -1) + 2
+				
+				
+					table.insert(chapter_list, chapter_index, {title = "[SponsorBlock]: ".. i.category, time = i.segment[1]})
+					table.insert(chapter_list, chapter_index, {title = " ", time = i.segment[2] -1 })
+				
+				
+					mp.set_property_native("chapter-list", chapter_list)
+				end
+
+
+
 				ON = true
-				mp.add_key_binding("b","sponsorblock",toggle)
+				send_state(ON)
+				mp.add_forced_key_binding("b","sponsorblock",toggle)
 				mp.observe_property("time-pos", "native", skip_ads)
 			end
 		end
@@ -113,6 +141,7 @@ function end_file()
 	mp.unobserve_property(skip_ads)
 	ranges = nil
 	ON = false
+	send_state(ON)
 end
 
 function toggle()
@@ -125,7 +154,11 @@ function toggle()
 		mp.osd_message("[sponsorblock] on")
 		ON = true
 	end
-	mp.commandv('script-message-to', 'ucm_sponsorblock_minimal_plugin', 'update-icon', tostring(ON))
+	send_state(ON)
+end
+
+function send_state(on_state)
+	mp.commandv('script-message-to', 'ucm_sponsorblock_minimal_plugin', 'update-icon', tostring(on_state))
 end
 
 mp.register_event("file-loaded", file_loaded)
