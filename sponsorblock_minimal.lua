@@ -124,6 +124,7 @@ function toggle()
 		mp.osd_message("[sponsorblock] on")
 		ON = true
 	end
+	mp.commandv('script-message-to', 'ucm_sponsorblock_minimal_plugin', 'update-icon', tostring(ON))
 end
 
 mp.register_event("file-loaded", file_loaded)
