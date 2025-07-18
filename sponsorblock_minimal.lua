@@ -1,4 +1,5 @@
 -- sponsorblock_minimal.lua
+-- source: https://codeberg.org/jouni/mpv_sponsorblock_minimal
 --
 -- This script skips sponsored segments of YouTube videos
 -- using data from https://github.com/ajayyy/SponsorBlock
@@ -9,6 +10,7 @@ local msg = require 'mp.msg'
 
 local ON = false
 local ranges = nil
+local skipped_chapters = {}
 
 local options = {
 	server = "https://sponsor.ajay.app/api/skipSegments",
@@ -18,32 +20,45 @@ local options = {
 
 	-- Set this to "true" to use sha256HashPrefix instead of videoID
 	hash = "",
-	-- suration the osd message shows up
-	show_msg = 3
+	-- duration the osd message shows up
+	show_msg = 3,
+	-- Skip each chapter only once
+	skip_once = true
 }
 
 opt.read_options(options)
 
-function skip_ads(name,pos)
-	if pos then
-		for _, i in pairs(ranges) do
-			v = i.segment[2]
-			if i.segment[1] <= pos and v > pos then
-				--this message may sometimes be wrong
-				--it only seems to be a visual thing though
-				mp.osd_message(("[sponsorblock] skipping forward %ds"):format(math.floor(v-mp.get_property("time-pos"))), options.show_msg)
-				--need to do the +0.01 otherwise mpv will start spamming skip sometimes
-				--example: https://www.youtube.com/watch?v=4ypMJzeNooo
-				mp.set_property("time-pos",v+0.01)
-				return
+function skip_sponsorblock_chapter(_, current_chapter)
+	if not ON or not current_chapter or current_chapter < 0 then return end
+	
+	local chapters = mp.get_property_native("chapter-list")
+	if not chapters then return end
+	-- Check if current chapter is a SponsorBlock chapter
+	local current_chapter_index = current_chapter + 1 -- Lua is 1-indexed
+
+	if current_chapter_index <= #chapters then
+		local chapter = chapters[current_chapter_index]
+		if chapter.title and string.match(chapter.title, "^%[SponsorBlock%]:") then
+			-- Check if we should skip this chapter
+			if not options.skip_once or not skipped_chapters[current_chapter_index] then
+				local category = string.match(chapter.title, "^%[SponsorBlock%]: (.+)")
+				mp.osd_message(("[sponsorblock] skipping %s"):format(category or "segment"), options.show_msg)
+				
+				-- Simply jump to next chapter
+				mp.set_property("chapter", current_chapter + 1)
+				skipped_chapters[current_chapter_index] = true
 			end
 		end
 	end
 end
 
-
-
 function file_loaded()
+	-- Reset for new file
+	skipped_chapters = {}
+	ranges = nil
+	ON = false
+	send_state(ON)
+	
 	local video_path = mp.get_property("path", "")
 	local video_referer = string.match(mp.get_property("http-header-fields", ""), "Referer:([^,]+)") or ""
 
@@ -104,53 +119,40 @@ function file_loaded()
 				ranges = json
 			end
 
-			--sponsorskip segments into chapters and color ranges
+			-- Add sponsorblock segments as chapters
 			if ranges then
+				local chapter_list = mp.get_property_native("chapter-list") or {{title = "", time = 0}}
 
 				for _, i in pairs(ranges) do
-
-
 					msg.info("ranges: " .. utils.to_string(i.segment))
 					msg.info("category: " .. i.category)
 
-					local chapter_list = mp.get_property_native("chapter-list")
-				
-					local chapter_index = (mp.get_property_number("chapter") or -1) + 2
-				
-				
-					table.insert(chapter_list, chapter_index, {title = "[SponsorBlock]: ".. i.category, time = i.segment[1]})
-					table.insert(chapter_list, chapter_index, {title = " ", time = i.segment[2] -1 })
-				
-				
-					mp.set_property_native("chapter-list", chapter_list)
+					-- Insert chapters for sponsor segments
+					table.insert(chapter_list, {title = "[SponsorBlock]: ".. i.category, time = i.segment[1]})
+					table.insert(chapter_list, {title = " ", time = i.segment[2]})
 				end
 
-
+				-- Sort chapters by time
+				table.sort(chapter_list, function(a, b) return a.time < b.time end)
+				mp.set_property_native("chapter-list", chapter_list)
 
 				ON = true
 				send_state(ON)
 				mp.add_forced_key_binding("b","sponsorblock",toggle)
-				mp.observe_property("time-pos", "native", skip_ads)
+				mp.observe_property("chapter", "number", skip_sponsorblock_chapter)
 			end
 		end
 	end
 end
 
-function end_file()
-	if not ON then return end
-	mp.unobserve_property(skip_ads)
-	ranges = nil
-	ON = false
-	send_state(ON)
-end
 
 function toggle()
 	if ON then
-		mp.unobserve_property(skip_ads)
+		mp.unobserve_property(skip_sponsorblock_chapter)
 		mp.osd_message("[sponsorblock] off")
 		ON = false
 	else
-		mp.observe_property("time-pos", "native", skip_ads)
+		mp.observe_property("chapter", "number", skip_sponsorblock_chapter)
 		mp.osd_message("[sponsorblock] on")
 		ON = true
 	end
@@ -162,4 +164,6 @@ function send_state(on_state)
 end
 
 mp.register_event("file-loaded", file_loaded)
-mp.register_event("end-file", end_file)
+mp.register_event("seek", function() 
+    skip_sponsorblock_chapter(nil, mp.get_property_number("chapter"))
+end)
