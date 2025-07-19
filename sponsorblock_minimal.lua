@@ -23,7 +23,21 @@ local options = {
 	-- duration the osd message shows up
 	show_msg = 3,
 	-- Skip each chapter only once
-	skip_once = true
+	skip_once = true,
+	-- genrate uosc button?
+	uosc_button = true,
+	-- sen button info directly to uosc or via other script?
+	uosc_direct = true,
+	-- Button info for uosc direct
+	button_enabled_icon = "shield",
+	button_disabled_icon = "remove_moderator",
+	button = {
+		icon = nil,
+		tooltip = "Sponsorblock",
+		command = "script-message sponsorblock toggle"
+	},
+	
+	
 }
 
 opt.read_options(options)
@@ -50,6 +64,62 @@ function skip_sponsorblock_chapter(_, current_chapter)
 			end
 		end
 	end
+end
+function bake_chapters(ranges)
+	local chapter_list = mp.get_property_native("chapter-list") or {{title = "", time = 0}}
+
+	for _, i in pairs(ranges) do
+		msg.info("ranges: " .. utils.to_string(i.segment))
+		msg.info("category: " .. i.category)
+
+		local start_time = i.segment[1]
+		local end_time = i.segment[2]
+		local tolerance = 1.0 -- seconds tolerance for "close by"
+		
+		-- Check for existing chapter near start time
+		local start_exists = false
+		local existing_start_title = nil
+		for _, chapter in ipairs(chapter_list) do
+			if math.abs(chapter.time - start_time) <= tolerance then
+				if chapter.title and string.match(chapter.title, "^%[SponsorBlock%]:") then
+					-- Already a SponsorBlock chapter, skip this entire segment
+					start_exists = true
+					break
+				else
+					-- Existing non-SponsorBlock chapter, preserve its title
+					existing_start_title = chapter.title
+					chapter.title = "[SponsorBlock]: " .. i.category
+					start_exists = true
+					break
+				end
+			end
+		end
+		
+		-- Only insert start chapter if none exists nearby
+		if not start_exists then
+			table.insert(chapter_list, {title = "[SponsorBlock]: " .. i.category, time = start_time})
+		end
+		
+		-- Check for existing chapter near end time
+		local end_exists = false
+		for _, chapter in ipairs(chapter_list) do
+			if math.abs(chapter.time - end_time) <= tolerance then
+				end_exists = true
+				break
+			end
+		end
+		
+		-- Only insert end chapter if none exists nearby
+		if not end_exists then
+			-- Use the preserved title from start chapter, or ' ' if it was already a SponsorBlock
+			local end_title = existing_start_title or ' '
+			table.insert(chapter_list, {title = end_title, time = end_time})
+		end
+	end
+
+	-- Sort chapters by time
+	table.sort(chapter_list, function(a, b) return a.time < b.time end)
+	mp.set_property_native("chapter-list", chapter_list)
 end
 
 function file_loaded()
@@ -121,26 +191,15 @@ function file_loaded()
 
 			-- Add sponsorblock segments as chapters
 			if ranges then
-				local chapter_list = mp.get_property_native("chapter-list") or {{title = "", time = 0}}
-
-				for _, i in pairs(ranges) do
-					msg.info("ranges: " .. utils.to_string(i.segment))
-					msg.info("category: " .. i.category)
-
-					-- Insert chapters for sponsor segments
-					table.insert(chapter_list, {title = "[SponsorBlock]: ".. i.category, time = i.segment[1]})
-					table.insert(chapter_list, {title = " ", time = i.segment[2]})
-				end
-
-				-- Sort chapters by time
-				table.sort(chapter_list, function(a, b) return a.time < b.time end)
-				mp.set_property_native("chapter-list", chapter_list)
+				
+				bake_chapters(ranges)
 
 				ON = true
 				send_state(ON)
 				mp.add_forced_key_binding("b","sponsorblock",toggle)
 				mp.observe_property("chapter", "number", skip_sponsorblock_chapter)
 			end
+
 		end
 	end
 end
@@ -160,10 +219,25 @@ function toggle()
 end
 
 function send_state(on_state)
-	mp.commandv('script-message-to', 'ucm_sponsorblock_minimal_plugin', 'update-icon', tostring(on_state))
+	if not options.uosc_direct then return end
+	if options.uosc_button then
+		if on_state then
+			options.button.icon = options.button_enabled_icon
+		else
+			options.button.icon = options.button_disabled_icon
+		end
+		mp.commandv('script-message-to', 'uosc', 'set-button', 'Sponsorblock_Button', utils.format_json(options.button))
+	else
+		mp.commandv('script-message-to', 'ucm_sponsorblock_minimal_plugin', 'update-icon', tostring(on_state))
+	end
 end
 
 mp.register_event("file-loaded", file_loaded)
 mp.register_event("seek", function() 
     skip_sponsorblock_chapter(nil, mp.get_property_number("chapter"))
 end)
+
+-- initialize button
+if options.uosc_button and options.uosc_direct then
+	mp.commandv('script-message-to', 'uosc', 'set-button', 'Sponsorblock_Button', utils.format_json(options.button))
+end
