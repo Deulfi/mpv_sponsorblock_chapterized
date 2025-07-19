@@ -31,16 +31,34 @@ local options = {
 	-- Button info for uosc direct
 	button_enabled_icon = "shield",
 	button_disabled_icon = "remove_moderator",
-	button = {
-		icon = nil,
-		tooltip = "Sponsorblock",
-		command = "script-message sponsorblock toggle"
-	},
-	
-	
+	button_tooltip = "Sponsorblock",
+	button_command = "script-message sponsorblock toggle",
+
 }
 
 opt.read_options(options)
+
+local button = {
+	icon = options.button_disabled_icon,
+	tooltip = options.button_tooltip,
+	command = options.button_command
+}
+
+-- Parser for categories from the conf file
+-- Accepts a string like 'sponsor,selfpromo' and converts to '"sponsor","selfpromo"'
+local function parse_categories(str)
+    if not str or str == "" then return '"sponsor","selfpromo"' end
+    -- Remove quotes and brackets, split by comma, wrap each in quotes
+    local categories = {}
+    for cat in str:gsub('[%[%]"\'%s]', ''):gmatch('[^,]+') do
+        table.insert(categories, '"' .. cat .. '"')
+    end
+    
+    return table.concat(categories, ",")
+end
+local categories = parse_categories(options.categories)
+
+
 
 function skip_sponsorblock_chapter(_, current_chapter)
 	if not ON or not current_chapter or current_chapter < 0 then return end
@@ -66,6 +84,7 @@ function skip_sponsorblock_chapter(_, current_chapter)
 	end
 end
 function bake_chapters(ranges)
+	print("bake_chapters", ranges)
 	local chapter_list = mp.get_property_native("chapter-list") or {{title = "", time = 0}}
 
 	for _, i in pairs(ranges) do
@@ -152,7 +171,7 @@ function file_loaded()
 	if not youtube_id or string.len(youtube_id) < 11 then return end
 	youtube_id = string.sub(youtube_id, 1, 11)
 
-	local args = {"curl", "-L", "-s", "-G", "--data-urlencode", ("categories=[%s]"):format(options.categories)}
+	local args = {"curl", "-L", "-s", "-G", "--data-urlencode", ("categories=[%s]"):format(categories)}
 	local url = options.server
 	if options.hash == "true" then
 		local sha = mp.command_native{
@@ -192,6 +211,10 @@ function file_loaded()
 			-- Add sponsorblock segments as chapters
 			if ranges then
 				
+				if ranges[1] == "categories parameter does not match format requirements." then 
+					msg.debug("ranges: " , utils.format_json(ranges))
+					return 
+				end
 				bake_chapters(ranges)
 
 				ON = true
@@ -222,11 +245,11 @@ function send_state(on_state)
 	if not options.uosc_direct then return end
 	if options.uosc_button then
 		if on_state then
-			options.button.icon = options.button_enabled_icon
+			button.icon = options.button_enabled_icon
 		else
-			options.button.icon = options.button_disabled_icon
+			button.icon = options.button_disabled_icon
 		end
-		mp.commandv('script-message-to', 'uosc', 'set-button', 'Sponsorblock_Button', utils.format_json(options.button))
+		mp.commandv('script-message-to', 'uosc', 'set-button', 'Sponsorblock_Button', utils.format_json(button))
 	else
 		mp.commandv('script-message-to', 'ucm_sponsorblock_minimal_plugin', 'update-icon', tostring(on_state))
 	end
@@ -238,6 +261,6 @@ mp.register_event("seek", function()
 end)
 
 -- initialize button
-if options.uosc_button and options.uosc_direct then
-	mp.commandv('script-message-to', 'uosc', 'set-button', 'Sponsorblock_Button', utils.format_json(options.button))
-end
+--if options.uosc_button and options.uosc_direct then
+--	mp.commandv('script-message-to', 'uosc', 'set-button', 'Sponsorblock_Button', utils.format_json(options.button))
+--end
