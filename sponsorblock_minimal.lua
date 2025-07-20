@@ -16,7 +16,7 @@ local options = {
 	server = "https://sponsor.ajay.app/api/skipSegments",
 	categories = '',
 	hash = "",
-	show_msg = 3,
+	show_msg_duration = 3,
 	skip_once = true,
 	uosc_button = true,
 	uosc_direct = true,
@@ -85,12 +85,12 @@ local function skip_current_chapter()
     local current = chapters[chapter + 1]
     if current.title and current.title:match("^%[SponsorBlock%]:") then
         local category = current.title:match("^%[SponsorBlock%]: (.+)")
-        mp.osd_message(("[sponsorblock] skipping %s"):format(category or "segment"), options.show_msg)
+        mp.osd_message(("[sponsorblock] skipping %s"):format(category or "segment"), options.show_msg_duration)
         mp.set_property("chapter", chapter + 1)
     end
 end
 
-local function segment_already_exists(existing_chapters, start_time)
+local function is_duplicate_segment(existing_chapters, start_time)
     for _, chapter in ipairs(existing_chapters) do
         if chapter.title and chapter.title:match("^%[SponsorBlock%]:") and 
            chapter.time == start_time then
@@ -98,6 +98,15 @@ local function segment_already_exists(existing_chapters, start_time)
         end
     end
     return false
+end
+local function count_preexisting_segment(existing_chapters)
+    local count = 0
+    for _, chapter in ipairs(existing_chapters) do
+        if chapter.title and chapter.title:match("^%[SponsorBlock%]:") then
+            count = count + 1
+        end
+    end
+    return count
 end
 
 local function find_restore_title(existing_chapters, start_time)
@@ -177,18 +186,15 @@ local function file_loaded()
 
     if not ranges or ranges[1] == "No valid categories provided." then return end
     local existing_chapters = mp.get_property_native("chapter-list") or {}
+    options.button_badge = count_preexisting_segment(existing_chapters)
     
-    options.button_badge = #ranges
     -- Create chapters for new segments
     for _, segment in pairs(ranges) do
         local start_time = segment.segment[1]
-		
         
-        if not segment_already_exists(existing_chapters, start_time) then
+        if not is_duplicate_segment(existing_chapters, start_time) then
             local end_title = find_restore_title(existing_chapters, start_time)
             add_sponsorblock_segment(segment, end_title)
-        else
-            -- count up for already existing sponsorblock segments
             options.button_badge = options.button_badge + 1
         end
     end
