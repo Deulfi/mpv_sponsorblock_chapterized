@@ -14,16 +14,18 @@ local skipped_chapters = {}
 
 local options = {
 	server = "https://sponsor.ajay.app/api/skipSegments",
-	categories = '"sponsor","selfpromo"',
+	categories = '',
 	hash = "",
 	show_msg = 3,
 	skip_once = true,
 	uosc_button = true,
 	uosc_direct = true,
+    show_sponsor_count=true,
 	button_enabled_icon = "shield",
 	button_disabled_icon = "remove_moderator",
 	button_tooltip = "Sponsorblock",
 	button_command = "script-message sponsorblock toggle",
+    button_badge=0,
 }
 
 opt.read_options(options)
@@ -41,12 +43,13 @@ local function send_state(on_state)
     if not options.uosc_button then return end
 
 	if not options.uosc_direct then
-		mp.commandv('script-message-to', 'ucm_sponsorblock_minimal_plugin', 'update-icon', tostring(on_state))
+		mp.commandv('script-message-to', 'ucm_sponsorblock_minimal_plugin', 'update-icon', tostring(on_state, options.button_badge))
 		return
 	end
     
     local button = {
         icon = on_state and options.button_enabled_icon or options.button_disabled_icon,
+        badge = options.show_sponsor_count and options.button_badge or nil,
         tooltip = options.button_tooltip,
         command = options.button_command
     }
@@ -96,7 +99,6 @@ local function segment_already_exists(existing_chapters, start_time)
     end
     return false
 end
-
 
 local function find_restore_title(existing_chapters, start_time)
     local restore_title = ' '
@@ -172,8 +174,11 @@ local function file_loaded()
     if type(json) ~= "table" or not json[1] then return end
     
     ranges = json
+
+    if not ranges or ranges[1] == "No valid categories provided." then return end
     local existing_chapters = mp.get_property_native("chapter-list") or {}
     
+    options.button_badge = #ranges
     -- Create chapters for new segments
     for _, segment in pairs(ranges) do
         local start_time = segment.segment[1]
@@ -182,6 +187,9 @@ local function file_loaded()
         if not segment_already_exists(existing_chapters, start_time) then
             local end_title = find_restore_title(existing_chapters, start_time)
             add_sponsorblock_segment(segment, end_title)
+        else
+            -- count up for already existing sponsorblock segments
+            options.button_badge = options.button_badge + 1
         end
     end
 
