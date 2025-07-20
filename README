@@ -1,5 +1,6 @@
 (This version generates chapters for sponsor segments, which are detected by uosc and highlighted in red on the seekbar. 
-Put <stream>button:Sponsorblock_Button or <has_chapter>button:Sponsorblock_Button in the controls= of your uosc.conf for a button.)
+Put <stream>button:Sponsorblock_Button or <has_chapter>button:Sponsorblock_Button in the controls= of your uosc.conf for a button.
+Drag the playback into the segment if you want to watch it.)
 This is a much more simple version of the sponsorblock mpv plugin.
 
 There are no other functions in this other than the sponsor skipping. Also this 
