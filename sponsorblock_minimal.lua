@@ -10,7 +10,9 @@ local msg = require 'mp.msg'
 
 local ON = false
 local sponsor_data = nil
-local skipped_chapters = {}
+local segment_cache = {} -- array of {time, title, category}
+local chapter_list = {}
+local duration = 0
 
 local options = {
 	server = "https://sponsor.ajay.app/api/skipSegments",
@@ -26,19 +28,13 @@ local options = {
 	button_command = "script-message sponsorblock toggle",
     button_badge=0,
 }
-local segment_cache = {} -- array of {time, title, category}
-local chapter_list = {}
-
 opt.read_options(options)
 
-local function parse_categories(str)
-    local cats = {}
-    for cat in str:gsub('%s', ''):gmatch('[^,]+') do
-        table.insert(cats, '"' .. cat .. '"')
-    end
-    return table.concat(cats, ",")
+local cats = {}
+for cat in options.categories:gsub('%s', ''):gmatch('[^,]+') do
+    table.insert(cats, '"' .. cat .. '"')
 end
-local parsed_categories = parse_categories(options.categories)
+local parsed_categories = table.concat(cats, ",")
 
 local function send_state(on_state)
     if not options.uosc_button then return end
@@ -57,25 +53,44 @@ local function send_state(on_state)
     mp.commandv('script-message-to', 'uosc', 'set-button', 'Sponsorblock_Button', utils.format_json(button))
 end
 
-local function create_chapter(title, time)
-    local chapters = mp.get_property_native("chapter-list") or {}
-    local duration = mp.get_property_native("duration")
-    table.insert(chapters, {
-        title = title, 
-        time = (duration and duration > time) and time or (duration and duration - 0.001 or time)
+local function create_chapter(timestamp, title)
+    local target_time = duration and math.min(timestamp, duration - 0.001) or timestamp
+
+    local insert_pos = #chapter_list + 1
+    local restore_title = "end of video"
+    
+    for i, chapter in ipairs(chapter_list) do
+        -- Check for existing chapter within tolerance
+        if math.abs(chapter.time - target_time) <= 5 then
+            if title then
+                chapter_list[i] = {title = title, time = target_time}
+            end
+            -- if it is a segment end and close by another chapter than the other chapter will close the segment
+            return
+        end
+        
+        -- Track insertion position and title for restoration
+        if chapter.time > target_time then
+            insert_pos = i
+            restore_title = chapter.title or ""
+            break
+        end
+    end
+    
+    -- Insert new chapter with proper title
+    table.insert(chapter_list, insert_pos, {
+        title = title or restore_title,
+        time = target_time
     })
-    table.sort(chapters, function(a, b) return a.time < b.time end)
-    mp.set_property_native("chapter-list", chapters)
 end
 
 local function build_segment_cache()
     segment_cache = {}
-    chapter_list = mp.get_property_native("chapter-list") or {}
     for i, chapter in ipairs(chapter_list) do
         local category = chapter.title:match("^%[SponsorBlock%]: (.+)")
         if category then
             local next_chapter = chapter_list[i + 1]
-            local end_time = next_chapter and next_chapter.time or mp.get_property_native("duration") - 0.5
+            local end_time = next_chapter and next_chapter.time or duration - 0.5
             table.insert(segment_cache, {
                 time = chapter.time,
                 end_time = end_time,
@@ -87,7 +102,6 @@ local function build_segment_cache()
     options.button_badge = #segment_cache
 end
 
-
 local function is_sponsorblock_segment(time)
     for _, segment in ipairs(segment_cache) do
         if segment.time == time then return segment end
@@ -95,21 +109,25 @@ local function is_sponsorblock_segment(time)
     return nil
 end
 
-local last_skip = 0
+--TODO: use mpv things for this? timeout?
+local skip_times = {}
 local function skip_current_chapter()
     if not ON then return end
 
-    -- otherwise this function would giht the user if they drag the playback into a segment
     local now = mp.get_time()
-    if now - last_skip < 0.1 then return end
-    last_skip = now
-    
+    table.insert(skip_times, now)
+    -- debaunce 5 times
+    if #skip_times > 5 then table.remove(skip_times, 1) end
+    if #skip_times == 5 and (skip_times[5] - skip_times[1] < 0.25) then
+        return
+    end
+
     local cur_chapter_index = mp.get_property_number("chapter")
     if not cur_chapter_index or cur_chapter_index < 0 then 
-        msg.debug("No chapter to skip or chapter_index is less than 0.")
+        msg.debug("closing mpv or no chapter to skip or chapter_index is less than 0: ", cur_chapter_index)
         return 
     end
-    cur_chapter_index = cur_chapter_index + 1 or 1 -- convert to 1-based index
+    cur_chapter_index = cur_chapter_index + 1 -- convert to 1-based index
 
     local current = chapter_list[cur_chapter_index]
     local segment = is_sponsorblock_segment(current.time)
@@ -121,27 +139,14 @@ local function skip_current_chapter()
 
     mp.osd_message(("[sponsorblock] skipping %s"):format(segment.category or "segment"), options.show_msg_duration)
     msg.info("Skipping chapter " .. cur_chapter_index .. " (" .. current.title .. ")")
-    --mp.set_property("time-pos",segment.end_time + 0.01) --both work
-    mp.set_property("chapter", cur_chapter_index)
-
+    mp.set_property("time-pos",segment.end_time + 0.01) --both work
+    --mp.set_property("chapter", cur_chapter_index)
 end
 
-local function find_restore_title(start_time)
-    local restore_title = ' '
-    for _, chapter in ipairs(chapter_list) do
-        if chapter.time <= start_time then
-            restore_title = chapter.title
-        else
-            break
-        end
-    end
-    return restore_title
-end
-
-local function add_sponsorblock_segment(segment, end_title)
+local function add_sponsorblock_segment(segment)
     local category = segment.category:gsub("^%l", string.upper):gsub("_", " ")
-    create_chapter("[SponsorBlock]: " .. category, segment.segment[1])
-    create_chapter(end_title, segment.segment[2])
+    create_chapter(segment.segment[1], "[SponsorBlock]: " .. category)
+    create_chapter(segment.segment[2])
 end
 
 local function toggle()
@@ -162,7 +167,7 @@ end
 local function file_loaded()
     sponsor_data = nil
     ON = false
-    segment_cache = {} -- Clear cache
+    segment_cache = {}
     send_state(ON)
     
     -- Extract YouTube ID
@@ -235,26 +240,22 @@ local function file_loaded()
         sponsor_data = json
     end
 
+
+    duration = mp.get_property_native("duration") or 0
+    chapter_list = mp.get_property_native("chapter-list") or {}
+
     -- Build initial cache from existing chapters
     build_segment_cache()
     -- Create chapters for new segments
     for _, segment in pairs(sponsor_data) do
-        local start_time = segment.segment[1]
-        -- only add if it is new and not in the cache already (could be already baked into the video)
-        if not is_sponsorblock_segment(start_time) then
-            local end_title = find_restore_title(start_time)
-            add_sponsorblock_segment(segment, end_title)
-        end
+        add_sponsorblock_segment(segment)
     end
+
     -- Rebuild cache after adding new chapters
     build_segment_cache()
+    -- Write back the updated chapter list once
+    mp.set_property_native("chapter-list", chapter_list)
 
-    -- in case there is a segment at the end of the video but no closing chapter, insert one (happend in a video with baked in segments).
-    local last_chapter = chapter_list[#chapter_list]
-    if last_chapter and is_sponsorblock_segment(last_chapter.time) then
-        create_chapter('EOF', mp.get_property_number("duration"))
-    end
-    
     ON = true
     send_state(ON)
     mp.observe_property("chapter", "number", skip_current_chapter)
