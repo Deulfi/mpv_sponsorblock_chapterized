@@ -30,6 +30,7 @@ local options = {
 }
 opt.read_options(options)
 
+local default_title
 local cats = {}
 for cat in options.categories:gsub('%s', ''):gmatch('[^,]+') do
     table.insert(cats, '"' .. cat .. '"')
@@ -71,7 +72,10 @@ local function create_chapter(timestamp, title)
     local target_time = duration and math.min(timestamp, duration - 0.001) or timestamp
 
     local insert_pos = #chapter_list + 1
-    local restore_title = "end of video"
+    if not default_title then
+        default_title = mp.get_property("media-title") or "no title"
+    end
+    local restore_title = default_title
     
     for i, chapter in ipairs(chapter_list) do
         -- Check for existing chapter within tolerance
@@ -79,14 +83,24 @@ local function create_chapter(timestamp, title)
             if title then
                 chapter_list[i] = {title = title, time = target_time}
             end
-            -- if it is a segment end and close by another chapter than the other chapter will close the segment
+            -- if it is a Sponsorblock segment end and close by another chapter 
+            -- than the other chapter will close the segment anyway, no need to insert an end-chapter
             return
         end
         
         -- Track insertion position and title for restoration
         if chapter.time > target_time then
             insert_pos = i
-            restore_title = chapter.title or ""
+            -- Look backwards to find the last non-SponsorBlock chapter
+            if not title then  -- Only for segment end chapters
+                for j = insert_pos - 1, 1, -1 do
+                    local prev_chapter = chapter_list[j]
+                    if prev_chapter and prev_chapter.title and not prev_chapter.title:match("^%[SponsorBlock%]:") then
+                        restore_title = prev_chapter.title
+                        break
+                    end
+                end
+            end
             break
         end
     end
@@ -178,36 +192,52 @@ local function toggle()
     send_state(ON)
 end
 
-local function file_loaded()
-    sponsor_data = nil
-    ON = false
-    segment_cache = {}
+local function activate_sponsorblock()
+    duration = mp.get_property_native("duration") or 0
+
+    -- Build initial cache from existing chapters
+    build_segment_cache()
+    -- Create chapters for new segments. empty table in case of local chapter list only
+    for _, segment in pairs(sponsor_data or {}) do
+        add_sponsorblock_segment(segment)
+    end
+
+    -- Rebuild cache after adding new chapters
+    build_segment_cache()
+    -- Write back the updated chapter list
+    mp.set_property_native("chapter-list", chapter_list)
+
+    ON = true
     send_state(ON)
-    
+    mp.observe_property("chapter", "number", skip_current_chapter)
+    mp.add_forced_key_binding("b","sponsorblock",toggle)
+end
+
+local function pull_sponsorskip_data()
     -- Extract YouTube ID
     local video_path = mp.get_property("path", "")
     local video_referer = mp.get_property("http-header-fields", ""):match("Referer:([^,]+)") or ""
     local purl = mp.get_property("metadata/by-key/PURL", "")
-    
+
     local patterns = {
         "ytdl://youtu%.be/([%w-_]+)", "ytdl://w?w?w?%.?youtube%.com/v/([%w-_]+)",
         "https?://youtu%.be/([%w-_]+)", "https?://w?w?w?%.?youtube%.com/v/([%w-_]+)",
         "/watch.*[?&]v=([%w-_]+)", "/embed/([%w-_]+)", "^ytdl://([%w-_]+)$", "-([%w-_]+)%."
     }
-    
+
     local youtube_id
     for _, pattern in ipairs(patterns) do
         youtube_id = video_path:match(pattern) or video_referer:match(pattern) or purl:match(pattern)
         if youtube_id then break end
     end
-    
-    if not youtube_id or #youtube_id < 11 then hide_button() return end
+
+    if not youtube_id or #youtube_id < 11 then hide_button() return false end
     youtube_id = youtube_id:sub(1, 11)
-    
+
     -- Prepare curl arguments
     local args = {"curl", "-L", "-s", "-G", "--data-urlencode", ("categories=[%s]"):format(parsed_categories)}
     local url = options.server
-    
+
     -- Handle hash functionality
     if options.hash == "true" then
         local sha = mp.command_native{
@@ -227,7 +257,7 @@ local function file_loaded()
         table.insert(args, "videoID=" .. youtube_id)
     end
     table.insert(args, url)
-    
+
     -- Fetch sponsor data
     local result = mp.command_native{
         name = "subprocess",
@@ -236,11 +266,11 @@ local function file_loaded()
         args = args
     }
 
-    if not result.stdout then hide_button() return end
-    
+    if not result.stdout then return false end
+
     local json = utils.parse_json(result.stdout)
-    if type(json) ~= "table" then hide_button() return end
-    
+    if type(json) ~= "table" then return false end
+
     -- Handle hash response format
     if options.hash == "true" then
         for _, i in pairs(json) do
@@ -250,30 +280,47 @@ local function file_loaded()
             end
         end
     else
-        if not json[1] or json[1] == "No valid categories provided." then hide_button() return end
+        if not json[1] or json[1] == "No valid categories provided." then return false end
         sponsor_data = json
     end
 
+    return true
+end
 
-    duration = mp.get_property_native("duration") or 0
-    chapter_list = mp.get_property_native("chapter-list") or {}
+local function file_loaded()
+    -- reset data
+    sponsor_data = nil
+    ON = false
+    segment_cache = {}
+    send_state(ON)
+    
+    local result = pull_sponsorskip_data()
+    chapter_list = mp.get_property_native("chapter-list", {})
+    if result then
+        activate_sponsorblock()
+        return
+    else
+        msg.info("No Sponsorblock data pulled from server")
+    end
+    
+    local local_sponsorblock_chapters = false
 
-    -- Build initial cache from existing chapters
-    build_segment_cache()
-    -- Create chapters for new segments
-    for _, segment in pairs(sponsor_data) do
-        add_sponsorblock_segment(segment)
+    if #chapter_list > 0 then
+        msg.info("looking for local sponsorblock chapters")
+        for i, chapter in ipairs(chapter_list) do
+            if chapter.title and chapter.title:match("^%[SponsorBlock%]:") then
+                local_sponsorblock_chapters = true
+                activate_sponsorblock(sponsor_data)
+                return
+            end
+        end
     end
 
-    -- Rebuild cache after adding new chapters
-    build_segment_cache()
-    -- Write back the updated chapter list once
-    mp.set_property_native("chapter-list", chapter_list)
-
-    ON = true
-    send_state(ON)
-    mp.observe_property("chapter", "number", skip_current_chapter)
-    mp.add_forced_key_binding("b","sponsorblock",toggle)
+    -- no server data and neither local chapters with sponsorskip segments
+    hide_button()
 end
 
 mp.register_event("file-loaded", file_loaded)
+
+-- hide on init
+--hide_button()
