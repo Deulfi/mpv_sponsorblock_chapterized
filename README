@@ -1,6 +1,6 @@
 (This version generates chapters for sponsor segments, which are detected by uosc and highlighted in red on the seekbar. 
 Put button:Sponsorblock_Button in the controls= of your uosc.conf for a button.
-Drag the playback into the segment if you want to watch it.)
+Drag the playback into the segment if you want to watch it. Also works with baked in chapters (if your yt-dlp embeds them for example).)
 
 This is a much more simple version of the sponsorblock mpv plugin.
 
