@@ -48,7 +48,21 @@ local function send_state(on_state)
         icon = on_state and options.button_enabled_icon or options.button_disabled_icon,
         badge = options.show_sponsor_count and options.button_badge or nil,
         tooltip = options.button_tooltip,
-        command = options.button_command
+        command = options.button_command,
+        hide = false
+    }
+    mp.commandv('script-message-to', 'uosc', 'set-button', 'Sponsorblock_Button', utils.format_json(button))
+end
+
+local function hide_button()
+    if not options.uosc_button then return end
+    msg.info("No Sponsorblock data, hiding button")
+    local button = {
+        icon = options.button_disabled_icon,
+        badge = options.show_sponsor_count and options.button_badge or nil,
+        tooltip = options.button_tooltip,
+        command = options.button_command,
+        hide = true
     }
     mp.commandv('script-message-to', 'uosc', 'set-button', 'Sponsorblock_Button', utils.format_json(button))
 end
@@ -90,7 +104,7 @@ local function build_segment_cache()
         local category = chapter.title:match("^%[SponsorBlock%]: (.+)")
         if category then
             local next_chapter = chapter_list[i + 1]
-            local end_time = next_chapter and next_chapter.time or duration - 0.5
+            local end_time = next_chapter and next_chapter.time or duration - 0.1
             table.insert(segment_cache, {
                 time = chapter.time,
                 end_time = end_time,
@@ -187,7 +201,7 @@ local function file_loaded()
         if youtube_id then break end
     end
     
-    if not youtube_id or #youtube_id < 11 then return end
+    if not youtube_id or #youtube_id < 11 then hide_button() return end
     youtube_id = youtube_id:sub(1, 11)
     
     -- Prepare curl arguments
@@ -222,10 +236,10 @@ local function file_loaded()
         args = args
     }
 
-    if not result.stdout then return end
+    if not result.stdout then hide_button() return end
     
     local json = utils.parse_json(result.stdout)
-    if type(json) ~= "table" then return end
+    if type(json) ~= "table" then hide_button() return end
     
     -- Handle hash response format
     if options.hash == "true" then
@@ -236,7 +250,7 @@ local function file_loaded()
             end
         end
     else
-        if not json[1] or json[1] == "No valid categories provided." then return end
+        if not json[1] or json[1] == "No valid categories provided." then hide_button() return end
         sponsor_data = json
     end
 
