@@ -322,5 +322,5 @@ end
 
 mp.register_event("file-loaded", file_loaded)
 
--- hide on init
---hide_button()
+-- hide on init (for idle)
+hide_button()
