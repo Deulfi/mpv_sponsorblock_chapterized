@@ -37,16 +37,16 @@ for cat in options.categories:gsub('%s', ''):gmatch('[^,]+') do
 end
 local parsed_categories = table.concat(cats, ",")
 
-local function send_state(on_state)
+local function update_button()
     if not options.uosc_button then return end
 
 	if not options.uosc_direct then
-		mp.commandv('script-message-to', 'ucm_sponsorblock_minimal_plugin', 'update-icon', tostring(on_state, options.button_badge))
+		mp.commandv('script-message-to', 'ucm_sponsorblock_minimal_plugin', 'update-icon', tostring(ON, options.button_badge))
 		return
 	end
     
     local button = {
-        icon = on_state and options.button_enabled_icon or options.button_disabled_icon,
+        icon = ON and options.button_enabled_icon or options.button_disabled_icon,
         badge = options.show_sponsor_count and options.button_badge or nil,
         tooltip = options.button_tooltip,
         command = options.button_command,
@@ -57,15 +57,8 @@ end
 
 local function hide_button()
     if not options.uosc_button then return end
-    msg.info("No Sponsorblock data, hiding button")
-    local button = {
-        icon = options.button_disabled_icon,
-        badge = options.show_sponsor_count and options.button_badge or nil,
-        tooltip = options.button_tooltip,
-        command = options.button_command,
-        hide = true
-    }
-    mp.commandv('script-message-to', 'uosc', 'set-button', 'Sponsorblock_Button', utils.format_json(button))
+    msg.info("No Sponsorblock data at the moment, hiding button")
+    mp.commandv('script-message-to', 'uosc', 'set-button', 'Sponsorblock_Button', utils.format_json({icon = "", hide = true}))
 end
 
 local function create_chapter(timestamp, title)
@@ -118,7 +111,7 @@ local function build_segment_cache()
         local category = chapter.title:match("^%[SponsorBlock%]: (.+)")
         if category then
             local next_chapter = chapter_list[i + 1]
-            local end_time = next_chapter and next_chapter.time or duration - 0.1
+            local end_time = next_chapter and next_chapter.time or duration - 0.001
             table.insert(segment_cache, {
                 time = chapter.time,
                 end_time = end_time,
@@ -146,7 +139,7 @@ local function skip_current_chapter()
     table.insert(skip_times, now)
     -- debaunce 5 times
     if #skip_times > 5 then table.remove(skip_times, 1) end
-    if #skip_times == 5 and (skip_times[5] - skip_times[1] < 0.25) then
+    if #skip_times == 5 and (skip_times[5] - skip_times[1] < 0.2) then
         return
     end
 
@@ -155,20 +148,20 @@ local function skip_current_chapter()
         msg.debug("closing mpv or no chapter to skip or chapter_index is less than 0: ", cur_chapter_index)
         return 
     end
-    cur_chapter_index = cur_chapter_index + 1 -- convert to 1-based index
+    local chapter_index = cur_chapter_index + 1 -- convert to 1-based index
 
-    local current = chapter_list[cur_chapter_index]
+    local current = chapter_list[chapter_index]
     local segment = is_sponsorblock_segment(current.time)
 
     if not segment then 
-        msg.debug("Debug: No segment found at chapter " .. cur_chapter_index)
+        msg.debug("Debug: No segment found at chapter " .. chapter_index)
         return 
     end
 
     mp.osd_message(("[sponsorblock] skipping %s"):format(segment.category or "segment"), options.show_msg_duration)
-    msg.info("Skipping chapter " .. cur_chapter_index .. " (" .. current.title .. ")")
-    mp.set_property("time-pos",segment.end_time + 0.01) --both work
-    --mp.set_property("chapter", cur_chapter_index)
+    msg.info("Skipping chapter " .. chapter_index .. " (" .. current.title .. ")")
+    mp.set_property("time-pos",segment.end_time + 0.01) -- just a bit outside to ensure it is outside the segment
+    --mp.set_property("chapter", chapter_index) --both work
 end
 
 local function add_sponsorblock_segment(segment)
@@ -189,7 +182,7 @@ local function toggle()
         mp.osd_message("[sponsorblock] on")
         ON = true
     end
-    send_state(ON)
+    update_button()
 end
 
 local function activate_sponsorblock()
@@ -208,21 +201,25 @@ local function activate_sponsorblock()
     mp.set_property_native("chapter-list", chapter_list)
 
     ON = true
-    send_state(ON)
+    update_button()
     mp.observe_property("chapter", "number", skip_current_chapter)
     mp.add_forced_key_binding("b","sponsorblock",toggle)
 end
 
 local function pull_sponsorskip_data()
     -- Extract YouTube ID
-    local video_path = mp.get_property("path", "")
+    local video_path    = mp.get_property("path", "")
     local video_referer = mp.get_property("http-header-fields", ""):match("Referer:([^,]+)") or ""
-    local purl = mp.get_property("metadata/by-key/PURL", "")
-
+    local purl          = mp.get_property("metadata/by-key/PURL", "")
     local patterns = {
-        "ytdl://youtu%.be/([%w-_]+)", "ytdl://w?w?w?%.?youtube%.com/v/([%w-_]+)",
-        "https?://youtu%.be/([%w-_]+)", "https?://w?w?w?%.?youtube%.com/v/([%w-_]+)",
-        "/watch.*[?&]v=([%w-_]+)", "/embed/([%w-_]+)", "^ytdl://([%w-_]+)$", "-([%w-_]+)%."
+        "ytdl://youtu%.be/([%w-_]+)", 
+        "ytdl://w?w?w?%.?youtube%.com/v/([%w-_]+)",
+        "https?://youtu%.be/([%w-_]+)", 
+        "https?://w?w?w?%.?youtube%.com/v/([%w-_]+)",
+        "/watch.*[?&]v=([%w-_]+)", 
+        "/embed/([%w-_]+)", 
+        "^ytdl://([%w-_]+)$", 
+        "-([%w-_]+)%."
     }
 
     local youtube_id
@@ -231,7 +228,7 @@ local function pull_sponsorskip_data()
         if youtube_id then break end
     end
 
-    if not youtube_id or #youtube_id < 11 then hide_button() return false end
+    if not youtube_id or #youtube_id < 11 then return false end
     youtube_id = youtube_id:sub(1, 11)
 
     -- Prepare curl arguments
@@ -292,7 +289,7 @@ local function file_loaded()
     sponsor_data = nil
     ON = false
     segment_cache = {}
-    send_state(ON)
+    hide_button()
     
     local result = pull_sponsorskip_data()
     chapter_list = mp.get_property_native("chapter-list", {})
@@ -301,23 +298,21 @@ local function file_loaded()
         return
     else
         msg.info("No Sponsorblock data pulled from server")
-    end
+    end 
     
     local local_sponsorblock_chapters = false
-
+    
+    -- if there are chapters and at least one ad chapter then process
     if #chapter_list > 0 then
         msg.info("looking for local sponsorblock chapters")
         for i, chapter in ipairs(chapter_list) do
             if chapter.title and chapter.title:match("^%[SponsorBlock%]:") then
                 local_sponsorblock_chapters = true
-                activate_sponsorblock(sponsor_data)
+                activate_sponsorblock()
                 return
             end
         end
     end
-
-    -- no server data and neither local chapters with sponsorskip segments
-    hide_button()
 end
 
 mp.register_event("file-loaded", file_loaded)
