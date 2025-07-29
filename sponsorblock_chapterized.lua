@@ -17,6 +17,7 @@ local duration = 0
 local options = {
 	server = "https://sponsor.ajay.app/api/skipSegments",
 	categories = '',
+    show_only_cats = 'intro, outro, interaction, music_offtopic, preview, poi_highlight, filler, exclusive_access',
 	hash = "",
 	show_msg_duration = 3,
 	uosc_button = true,
@@ -25,17 +26,27 @@ local options = {
 	button_enabled_icon = "shield",
 	button_disabled_icon = "remove_moderator",
 	button_tooltip = "Sponsorblock",
-	button_command = "script-message sponsorblock toggle",
-    button_badge=0,
 }
 opt.read_options(options)
 
-local default_title
-local cats = {}
-for cat in options.categories:gsub('%s', ''):gmatch('[^,]+') do
-    table.insert(cats, '"' .. cat .. '"')
+-- Build show_only lookup table once with processed category names
+local show_only_table = {}
+for cat in options.show_only_cats:gsub('%s', ''):gmatch('[^,]+') do
+    local processed_cat = cat:gsub("^%l", string.upper):gsub("_", " ")
+    show_only_table[processed_cat] = true
 end
-local parsed_categories = table.concat(cats, ",")
+
+local button_command = "script-message sponsorblock toggle"
+local button_badge
+local default_title
+
+local function parsed_categories(cats_to_parse)
+    local cats = {}
+    for cat in cats_to_parse:gsub('%s', ''):gmatch('[^,]+') do
+        table.insert(cats, '"' .. cat .. '"')
+    end
+    return table.concat(cats, ",")
+end
 
 local function update_button()
     if not options.uosc_button then return end
@@ -47,9 +58,9 @@ local function update_button()
     
     local button = {
         icon = ON and options.button_enabled_icon or options.button_disabled_icon,
-        badge = options.show_sponsor_count and options.button_badge or nil,
+        badge = options.show_sponsor_count and button_badge or nil,
         tooltip = options.button_tooltip,
-        command = options.button_command,
+        command = button_command,
         hide = false
     }
     mp.commandv('script-message-to', 'uosc', 'set-button', 'Sponsorblock_Button', utils.format_json(button))
@@ -123,10 +134,23 @@ local function build_segment_cache()
     options.button_badge = #segment_cache
 end
 
-local function is_sponsorblock_segment(time)
+local function get_actionable_segment(chapter, chapter_index)
+    
+    local start_time = chapter.time
     for _, segment in ipairs(segment_cache) do
-        if segment.time == time then return segment end
+        if segment.time == start_time then
+            -- Check if this segment's category is in show_only_cats
+            if show_only_table[segment.category] then
+                msg.debug("Debug: Skipping mark-only segment: " , segment.category)
+                return nil -- Don't skip, just mark
+            else
+                mp.osd_message(("[sponsorblock] skipping %s"):format(segment.category or "segment"), options.show_msg_duration)
+                msg.info("Skipping chapter " .. chapter_index .. " (" .. chapter.title .. ")")
+                return segment -- Should be skipped
+            end
+        end
     end
+    msg.debug("Debug: No actionable segment found at " .. start_time)
     return nil
 end
 
@@ -149,18 +173,13 @@ local function skip_current_chapter()
         return 
     end
     local chapter_index = cur_chapter_index + 1 -- convert to 1-based index
+    local current_chapter = chapter_list[chapter_index]
 
-    local current = chapter_list[chapter_index]
-    local segment = is_sponsorblock_segment(current.time)
+    local segment = get_actionable_segment(current_chapter, chapter_index)
+    if not segment then return end
 
-    if not segment then 
-        msg.debug("Debug: No segment found at chapter " .. chapter_index)
-        return 
-    end
-
-    mp.osd_message(("[sponsorblock] skipping %s"):format(segment.category or "segment"), options.show_msg_duration)
-    msg.info("Skipping chapter " .. chapter_index .. " (" .. current.title .. ")")
-    mp.set_property("time-pos",segment.end_time + 0.01) -- just a bit outside to ensure it is outside the segment
+    local skip_to = math.min(segment.end_time + 0.01, duration - 0.1) -- don't skip past video end
+    mp.set_property("time-pos", skip_to)
     --mp.set_property("chapter", chapter_index) --both work
 end
 
@@ -207,6 +226,9 @@ local function activate_sponsorblock()
 end
 
 local function pull_sponsorskip_data()
+    local categories_str = parsed_categories(options.categories) 
+    categories_str = categories_str .. "," .. parsed_categories(options.show_only_cats)
+
     -- Extract YouTube ID
     local video_path    = mp.get_property("path", "")
     local video_referer = mp.get_property("http-header-fields", ""):match("Referer:([^,]+)") or ""
@@ -232,7 +254,7 @@ local function pull_sponsorskip_data()
     youtube_id = youtube_id:sub(1, 11)
 
     -- Prepare curl arguments
-    local args = {"curl", "-L", "-s", "-G", "--data-urlencode", ("categories=[%s]"):format(parsed_categories)}
+    local args = {"curl", "-L", "-s", "-G", "--data-urlencode", ("categories=[%s]"):format(categories_str)}
     local url = options.server
 
     -- Handle hash functionality
