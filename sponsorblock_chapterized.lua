@@ -16,25 +16,19 @@ local duration = 0
 
 local options = {
 	server = "https://sponsor.ajay.app/api/skipSegments",
-	categories = '',
-    show_only_cats = 'intro, outro, interaction, music_offtopic, preview, poi_highlight, filler, exclusive_access',
+	categories = "",
+    show_only_cats = "",
 	hash = "",
 	show_msg_duration = 3,
 	uosc_button = true,
 	uosc_direct = true,
-    show_sponsor_count=true,
+    show_sponsor_count = true,
 	button_enabled_icon = "shield",
 	button_disabled_icon = "remove_moderator",
 	button_tooltip = "Sponsorblock",
 }
 opt.read_options(options)
 
--- Build show_only lookup table once with processed category names
-local show_only_table = {}
-for cat in options.show_only_cats:gsub('%s', ''):gmatch('[^,]+') do
-    local processed_cat = cat:gsub("^%l", string.upper):gsub("_", " ")
-    show_only_table[processed_cat] = true
-end
 
 local button_command = "script-message sponsorblock toggle"
 local button_badge
@@ -47,14 +41,21 @@ local function parsed_categories(cats_to_parse)
     end
     return table.concat(cats, ",")
 end
+-- Build show_only lookup table once with processed category names
+local show_only_table = {}
+for cat in options.show_only_cats:gsub('%s', ''):gmatch('[^,]+') do
+    local processed_cat = cat:gsub("^%l", string.upper):gsub("_", " ")
+    show_only_table[processed_cat] = true
+end
 
 local function update_button()
     if not options.uosc_button then return end
 
 	if not options.uosc_direct then
-		mp.commandv('script-message-to', 'ucm_sponsorblock_minimal_plugin', 'update-icon', tostring(ON, options.button_badge))
+		mp.commandv('script-message-to', 'ucm_sponsorblock_minimal_plugin', 'update-icon', tostring(ON, button_badge))
 		return
 	end
+    print("button_badge", button_badge)
     
     local button = {
         icon = ON and options.button_enabled_icon or options.button_disabled_icon,
@@ -131,7 +132,7 @@ local function build_segment_cache()
             })
         end
     end
-    options.button_badge = #segment_cache
+    button_badge = #segment_cache
 end
 
 local function get_actionable_segment(chapter, chapter_index)
@@ -140,6 +141,7 @@ local function get_actionable_segment(chapter, chapter_index)
     for _, segment in ipairs(segment_cache) do
         if segment.time == start_time then
             -- Check if this segment's category is in show_only_cats
+            msg.debug("Debug: Checking if " .. segment.category .. " is in show_only_cats:", utils.format_json(show_only_table))
             if show_only_table[segment.category] then
                 msg.debug("Debug: Skipping mark-only segment: " , segment.category)
                 return nil -- Don't skip, just mark
