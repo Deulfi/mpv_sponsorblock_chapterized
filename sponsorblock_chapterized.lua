@@ -75,47 +75,62 @@ end
 
 local function create_chapter(timestamp, title)
     local target_time = duration and math.min(timestamp, duration - 0.001) or timestamp
-
-    local insert_pos = #chapter_list + 1
+    local tolerance = 5
+    local is_segment_start = title and title:match("^%[SponsorBlock%]:")
+    
     if not default_title then
         default_title = mp.get_property("media-title") or "no title"
     end
-    local restore_title = default_title
+    
+    -- Find insertion position and nearby chapter in one pass
+    local insert_pos = #chapter_list + 1
+    local nearby_chapter = nil
+    local nearby_index = nil
     
     for i, chapter in ipairs(chapter_list) do
-        -- Check for existing chapter within tolerance
-        if math.abs(chapter.time - target_time) <= 5 then
-            if title then
-                chapter_list[i] = {title = title, time = target_time}
-            end
-            -- if it is a Sponsorblock segment end and close by another chapter 
-            -- than the other chapter will close the segment anyway, no need to insert an end-chapter
-            return
+        if math.abs(chapter.time - target_time) <= tolerance then
+            nearby_chapter = chapter
+            nearby_index = i
         end
-        
-        -- Track insertion position and title for restoration
-        if chapter.time > target_time then
+        if chapter.time > target_time and not nearby_chapter then
             insert_pos = i
-            -- Look backwards to find the last non-SponsorBlock chapter
-            if not title then  -- Only for segment end chapters
-                for j = insert_pos - 1, 1, -1 do
-                    local prev_chapter = chapter_list[j]
-                    if prev_chapter and prev_chapter.title and not prev_chapter.title:match("^%[SponsorBlock%]:") then
-                        restore_title = prev_chapter.title
-                        break
-                    end
-                end
-            end
-            break
         end
     end
     
-    -- Insert new chapter with proper title
-    table.insert(chapter_list, insert_pos, {
-        title = title or restore_title,
-        time = target_time
-    })
+    -- Handle existing nearby chapter
+    if nearby_chapter then
+        local is_nearby_sponsor = nearby_chapter.title and nearby_chapter.title:match("^%[SponsorBlock%]:")
+        
+        -- Replace normal chapter with segment start, or skip if both are SponsorBlock
+        if is_segment_start then
+            if not is_nearby_sponsor then
+                chapter_list[nearby_index] = {title = title, time = target_time}
+            end
+            return
+        end
+        
+        -- Skip segment end only if nearby chapter is normal (can serve as boundary)
+        if not is_nearby_sponsor then
+            return
+        end
+    end
+    
+    -- Create new chapter (segment start, segment end, or no nearby chapter found)
+    local chapter_title = title
+    if not title then -- segment end needs title restoration
+        chapter_title = default_title
+        for i = insert_pos - 1, 1, -1 do
+            local prev = chapter_list[i]
+            if prev and prev.title and not prev.title:match("^%[SponsorBlock%]:") then
+                chapter_title = prev.title
+                break
+            end
+        end
+    end
+    
+    table.insert(chapter_list, insert_pos, {title = chapter_title, time = target_time})
 end
+    
 
 local function build_segment_cache()
     segment_cache = {}
