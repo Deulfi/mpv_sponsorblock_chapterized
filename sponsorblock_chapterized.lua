@@ -1,8 +1,9 @@
--- sponsorblock_minimal.lua
--- source: https://codeberg.org/jouni/mpv_sponsorblock_minimal
---
--- This script skips sponsored segments of YouTube videos
--- using data from https://github.com/ajayyy/SponsorBlock
+-- Fixed version with proper data structure and synchronization
+-- Key fixes:
+-- 1. Use chapter indices instead of direct references (prevents stale references)
+-- 2. Keep segment times (start/end) as source of truth
+-- 3. Rebuild segment_cache from chapter_list after all processing
+-- 4. Proper merging of baked-in chapters with fresh segments using time tolerance
 
 local opt = require 'mp.options'
 local utils = require 'mp.utils'
@@ -10,8 +11,7 @@ local msg = require 'mp.msg'
 
 local ON = false
 local sponsor_data = nil
-local segment_cache = {} -- time-indexed table: {[time] = {start_time, end_time, title, category}}
-local segment_cache = {}
+local segment_cache = {} -- Array of {start, end, category, start_idx, end_idx}
 local chapter_list = {}
 local duration = 0
 
@@ -30,16 +30,13 @@ local options = {
     also_pull_for_local = false,
     skip_unknown = false,
     min_segment_length = 1,
+    time_tolerance = 5.0, -- For matching baked-in vs fresh segments
 }
 opt.read_options(options)
 
 local button_command = "script-message sponsorblock toggle"
 local num_seg_found
-local state = {
-    chapter_index = 1,
-    range_index = 1,
-    last_viable_title = "default_title"
- }
+
 -- Helper function to process category names consistently
 local function process_category(cat)
     return cat:gsub("^%l", string.upper):gsub("_", " ")
@@ -89,29 +86,306 @@ local function hide_button()
 end
 
 local function match_category(title)
-    return title:match("^%[SponsorBlock%]: (.+)") or false
+    return title and title:match("^%[SponsorBlock%]: (.+)") or false
 end
 
-local function init_segment_cache()
-    local count = 0
+-- Find chapter index by time (with tolerance)
+local function find_chapter_by_time(time, tolerance)
+    tolerance = tolerance or 0.5
+    for i, chapter in ipairs(chapter_list) do
+        if math.abs(chapter.time - time) <= tolerance then
+            return i
+        end
+    end
+    return nil
+end
+
+-- Rebuild segment_cache from chapter_list (source of truth)
+-- This ensures consistency after any modifications
+local function rebuild_segment_cache()
+    segment_cache = {}
+    num_seg_found = 0
+    
     for i, chapter in ipairs(chapter_list) do
         local category = match_category(chapter.title)
         if category then
             local next_chapter = chapter_list[i + 1]
             local end_time = next_chapter and next_chapter.time or duration - 0.001
-
-            table.insert(segment_cache, {
-                start_chapter = chapter,
-                end_chapter = next_chapter,
-                start = chapter.time,
-                ['end'] = end_time,
-                title = chapter.title,
-                category = category,
-            })
-            count = count + 1
+            
+            -- Check for valid segment
+            if end_time > chapter.time then
+                table.insert(segment_cache, {
+                    start = chapter.time,
+                    ['end'] = end_time,
+                    category = category,
+                    start_idx = i,
+                    end_idx = next_chapter and (i + 1) or nil,
+                })
+                num_seg_found = num_seg_found + 1
+            end
         end
     end
-    return count > 0 and count or nil
+    
+    return num_seg_found > 0
+end
+
+-- Find or create chapter at time (with tolerance matching)
+local function find_or_create_chapter(time, title, tolerance)
+    tolerance = tolerance or options.time_tolerance
+    
+    -- First, try to find existing chapter within tolerance
+    local idx = find_chapter_by_time(time, tolerance)
+    
+    if idx then
+        local existing = chapter_list[idx]
+        -- If we're adding a SponsorBlock chapter, replace normal chapter
+        if title and match_category(title) and not match_category(existing.title) then
+            chapter_list[idx] = {title = title, time = time}
+            return idx
+        end
+        -- If both are SponsorBlock or both are normal, keep existing (or merge logic here)
+        return idx
+    end
+    
+    -- Create new chapter at correct position
+    local insert_pos = #chapter_list + 1
+    for i, chapter in ipairs(chapter_list) do
+        if chapter.time > time then
+            insert_pos = i
+            break
+        end
+    end
+    
+    table.insert(chapter_list, insert_pos, {title = title, time = time})
+    return insert_pos
+end
+
+-- Merge baked-in segments with fresh segments
+-- Handles time differences between existing chapters and API data
+local function merge_segments()
+    -- First, extract segments from existing chapters (baked-in)
+    local baked_segments = {}
+    for i, chapter in ipairs(chapter_list) do
+        local category = match_category(chapter.title)
+        if category then
+            local next_chapter = chapter_list[i + 1]
+            local end_time = next_chapter and next_chapter.time or duration - 0.001
+            table.insert(baked_segments, {
+                start = chapter.time,
+                ['end'] = end_time,
+                category = category,
+                source = "baked"
+            })
+        end
+    end
+    
+    -- Add fresh segments from API
+    local fresh_segments = {}
+    if sponsor_data then
+        for _, segment in pairs(sponsor_data) do
+            local delta = segment.segment[2] - segment.segment[1]
+            if delta > options.min_segment_length then
+                table.insert(fresh_segments, {
+                    start = segment.segment[1],
+                    ['end'] = segment.segment[2],
+                    category = process_category(segment.category),
+                    source = "fresh"
+                })
+            end
+        end
+    end
+    
+    -- Merge: prefer fresh segments, but merge with baked if within tolerance
+    local merged = {}
+    local used_baked = {} -- Track which baked segments were merged
+    
+    -- Process fresh segments first (they take precedence)
+    for _, fresh in ipairs(fresh_segments) do
+        local merged_segment = {start = fresh.start, ['end'] = fresh['end'], category = fresh.category}
+        
+        -- Check if any baked segment matches (within tolerance)
+        for i, baked in ipairs(baked_segments) do
+            if not used_baked[i] and 
+               math.abs(baked.start - fresh.start) <= options.time_tolerance and
+               math.abs(baked['end'] - fresh['end']) <= options.time_tolerance then
+                -- Use baked chapter times (they might be more precise)
+                merged_segment.start = baked.start
+                merged_segment['end'] = baked['end']
+                used_baked[i] = true
+                break
+            end
+        end
+        
+        table.insert(merged, merged_segment)
+    end
+    
+    -- Add remaining baked segments that weren't merged
+    for i, baked in ipairs(baked_segments) do
+        if not used_baked[i] then
+            table.insert(merged, {start = baked.start, ['end'] = baked['end'], category = baked.category})
+        end
+    end
+    
+    -- Remove duplicates (same start/end within tolerance)
+    for i = #merged, 2, -1 do
+        for j = i - 1, 1, -1 do
+            if math.abs(merged[i].start - merged[j].start) <= 0.5 and
+               math.abs(merged[i]['end'] - merged[j]['end']) <= 0.5 then
+                table.remove(merged, i)
+                break
+            end
+        end
+    end
+    
+    -- Sort by start time
+    table.sort(merged, function(a, b) return a.start < b.start end)
+    
+    -- Handle overlaps
+    local final_segments = {}
+    for _, seg in ipairs(merged) do
+        if #final_segments == 0 then
+            table.insert(final_segments, seg)
+        else
+            local last = final_segments[#final_segments]
+            -- Check for overlap
+            if seg.start < last['end'] then
+                -- Overlap: keep the longer segment, or prefer the one that's more precise
+                if seg['end'] - seg.start > last['end'] - last.start then
+                    final_segments[#final_segments] = seg
+                -- else keep last
+                end
+            else
+                table.insert(final_segments, seg)
+            end
+        end
+    end
+    
+    -- Preserve non-SponsorBlock chapters, rebuild SponsorBlock ones
+    local preserved_chapters = {}
+    for _, chapter in ipairs(chapter_list) do
+        if not match_category(chapter.title) then
+            table.insert(preserved_chapters, chapter)
+        end
+    end
+    
+    -- Create new chapter list with preserved chapters + SponsorBlock segments
+    chapter_list = {}
+    
+    -- Add all preserved chapters
+    for _, chapter in ipairs(preserved_chapters) do
+        table.insert(chapter_list, chapter)
+    end
+    
+    -- Add SponsorBlock segment chapters
+    local default_title = mp.get_property("media-title") or "no title"
+    
+    -- Track which preserved chapters we've used as end boundaries (to avoid duplicates)
+    local used_preserved_as_end = {}
+    
+    for _, seg in ipairs(final_segments) do
+        -- Add start chapter
+        local start_chapter = {title = "[SponsorBlock]: " .. seg.category, time = seg.start}
+        table.insert(chapter_list, start_chapter)
+        
+        -- Add end chapter
+        -- First, check if there's a preserved chapter at the exact end time (within small tolerance)
+        local end_chapter = nil
+        local found_preserved = false
+        local small_tol = 0.001
+        for i, preserved in ipairs(preserved_chapters) do
+            if not used_preserved_as_end[i] and math.abs(preserved.time - seg['end']) <= small_tol then
+                -- Use the preserved chapter as the end boundary - don't create duplicate
+                -- Mark it as used so we don't use it again
+                used_preserved_as_end[i] = true
+                found_preserved = true
+                -- Don't add a duplicate - the preserved chapter is already in chapter_list
+                break
+            end
+        end
+        
+        if not found_preserved then
+            -- Create new end chapter and restore title from nearest previous chapter
+            end_chapter = {title = default_title, time = seg['end']}
+            
+            -- Find the nearest previous non-SponsorBlock chapter (by time, not array order)
+            local nearest_chapter = nil
+            local nearest_time = -1
+            
+            -- Check already-added chapters in chapter_list
+            for _, prev in ipairs(chapter_list) do
+                if prev.time < seg['end'] and prev.title and not match_category(prev.title) then
+                    if prev.time > nearest_time then
+                        nearest_time = prev.time
+                        nearest_chapter = prev
+                    end
+                end
+            end
+            
+            -- Also check preserved chapters (in case they weren't added yet)
+            for _, preserved in ipairs(preserved_chapters) do
+                if preserved.time < seg['end'] and not match_category(preserved.title) then
+                    if preserved.time > nearest_time then
+                        nearest_time = preserved.time
+                        nearest_chapter = preserved
+                    end
+                end
+            end
+            
+            if nearest_chapter then
+                end_chapter.title = nearest_chapter.title
+            end
+            
+            table.insert(chapter_list, end_chapter)
+        end
+    end
+    
+    -- Sort by time
+    table.sort(chapter_list, function(a, b) return a.time < b.time end)
+    
+    -- Now merge chapters that are very close together (within tolerance)
+    -- This handles the baked-in vs fresh time differences
+    -- BUT: Don't merge a segment's own start and end chapters
+    for i = #chapter_list, 2, -1 do
+        local curr = chapter_list[i]
+        local prev = chapter_list[i - 1]
+        
+        if math.abs(curr.time - prev.time) <= options.time_tolerance then
+            -- Check if these are the start/end of the same segment
+            -- A segment's own start and end should never be merged
+            local are_same_segment = false
+            local small_tol = 0.01  -- Small tolerance for floating point comparison
+            for _, seg in ipairs(final_segments) do
+                if (math.abs(prev.time - seg.start) <= small_tol and math.abs(curr.time - seg['end']) <= small_tol) or
+                   (math.abs(curr.time - seg.start) <= small_tol and math.abs(prev.time - seg['end']) <= small_tol) then
+                    are_same_segment = true
+                    break
+                end
+            end
+            
+            -- Never merge a segment's own boundaries
+            if are_same_segment then
+                -- Keep both chapters - these are start/end of the same segment
+            elseif match_category(curr.title) and not match_category(prev.title) then
+                -- Replace prev with curr
+                chapter_list[i - 1] = curr
+                table.remove(chapter_list, i)
+            elseif match_category(prev.title) and not match_category(curr.title) then
+                -- Keep prev, remove curr
+                table.remove(chapter_list, i)
+            elseif match_category(curr.title) and match_category(prev.title) then
+                -- Both are SponsorBlock: keep one, remove duplicate (but not if same segment)
+                table.remove(chapter_list, i)
+            else
+                -- Both are normal: keep the one with better title or remove duplicate
+                if curr.title == prev.title then
+                    table.remove(chapter_list, i)
+                end
+            end
+        end
+    end
+    
+    -- Rebuild cache from final chapter list
+    rebuild_segment_cache()
 end
 
 local function get_actionable_segment(start_time, chapter_index)
@@ -130,14 +404,14 @@ local function get_actionable_segment(start_time, chapter_index)
         return nil -- Don't skip, just mark
     elseif cats_lookup[segment.category] then
         mp.osd_message(("[sponsorblock] skipping %s"):format(segment.category), options.show_msg_duration)
-        msg.info("Skipping chapter:", chapter_index, "(" .. segment.title .. ")")
+        msg.info("Skipping chapter:", chapter_index, "(" .. segment.category .. ")")
         return segment -- Should be skipped
     else
         -- Try to match segment.category with both show_only_lookup and cats_lookup using pattern matching
         for cat, _ in pairs(cats_lookup) do
             if segment.category:match(cat) then
                 mp.osd_message(("[sponsorblock] skipping %s"):format(segment.category), options.show_msg_duration)
-                msg.info("Skipping chapter (pattern):", chapter_index, "(" .. segment.title .. ")" , "matched against", cat)
+                msg.info("Skipping chapter (pattern):", chapter_index, "(" .. segment.category .. ")", "matched against", cat)
                 return segment
             end
         end
@@ -170,14 +444,15 @@ local function skip_current_chapter()
 
     local cur_chapter_index = mp.get_property_number("chapter")
     if not cur_chapter_index or cur_chapter_index < 0 then return end
-    local start_time =  mp.get_property_number("chapter-list/"..cur_chapter_index.."/time")
-    if not start_time then return end
+    
+    -- Use segment_cache which has reliable start/end times
+    local chapter_time = mp.get_property_number("chapter-list/"..cur_chapter_index.."/time")
+    if not chapter_time then return end
 
-    local segment = get_actionable_segment(start_time, cur_chapter_index)
+    local segment = get_actionable_segment(chapter_time, cur_chapter_index)
     if not segment then return end
 
-    --local skip_to = math.min(segment.end_time + 0.01, duration - 0.1)
-    local skip_to = math.min(segment.end_chapter and segment.end_chapter.time + 0.01 or 9999999999999, duration - 0.1)
+    local skip_to = math.min(segment['end'] + 0.01, duration - 0.1)
     mp.set_property("time-pos", skip_to)
 end
 
@@ -195,324 +470,21 @@ local function toggle()
     end
     update_button()
 end
--- Converts a chapter time (in seconds) to a human-readable string "MM:SS"
-local function readable(time)
-    if not time or type(time) ~= "number" then return "??:??" end
-    local total_seconds = math.floor(time + 0.5)
-    local minutes = math.floor(total_seconds / 60)
-    local seconds = total_seconds % 60
-    return string.format("%02d:%02d", minutes, seconds)
-end
 
-local function processChapterInLoop(state)
-    local current_chapter = chapter_list[state.chapter_index]
-    local next_chapter = chapter_list[state.chapter_index + 1]
-
-    msg.error("Chapter " .. state.chapter_index ..  " " .. current_chapter.title .. " " .. readable(current_chapter.time))
-    msg.error("Segment " .. state.range_index .. " "  .. " " .. readable(segment_cache[state.range_index].start) .. " " .. readable(segment_cache[state.range_index]['end']))
-
+local function activate_sponsorblock()
+    duration = mp.get_property_native("duration") or 0
     
-    if state.range_index > #segment_cache then 
-        return false  -- Break signal
-    end
+    -- Get existing chapters
+    chapter_list = mp.get_property_native("chapter-list", {})
     
-    local current_range = segment_cache[state.range_index]
-    local next_range = segment_cache[state.range_index + 1]
-
-    local is_sponsor_start = current_chapter == current_range.start_chapter or match_category(current_chapter.title)
-    local is_sponsor_end = current_chapter == current_range.end_chapter or current_chapter.title == "end"
+    -- Merge baked-in chapters with fresh segments from API
+    merge_segments()
     
-    -- Normal chapter
-    if not is_sponsor_start and not is_sponsor_end then
-        state.last_viable_title = current_chapter.title
-        state.chapter_index = state.chapter_index + 1
-        msg.debug("Normal chapter", current_chapter.title, "chapter index", state.chapter_index, "is normal and segment_index is", state.range_index)
-        return true
-    end
-    
-
-    if is_sponsor_start then
-        -- No more segments, skip to end processing
-        if not next_range then 
-            state.chapter_index = state.chapter_index + 1
-            return true
-        end
-
-        -- Case: Duplicates
-        for i, next_range in ipairs(segment_cache) do
-            msg.debug("Segment " .. i .. " "  .. " " .. readable(segment_cache[i].start) .. " " .. readable(segment_cache[i]['end']))
-            if  math.abs(current_range.start - next_range.start) <= 0.5 and i ~= state.range_index then
-                if math.abs(current_range['end'] - next_range['end']) <= 0.5 then
-                    print("checking duplicates: current=" .. current_range.start .. "-" .. current_range['end'] .. " vs next=" .. (next_range and next_range.start or "nil") .. "-" .. (next_range and next_range['end'] or "nil"))
-                    
-                    table.remove(segment_cache, i)
-                    table.remove(chapter_list, state.chapter_index + 2)
-                    table.remove(chapter_list, state.chapter_index + 2)
-                    msg.debug("Duplicate, same start and end", state.chapter_index, " - ", i)
-                    return true
-                
-                else
-                    msg.debug("Not dupe, same start but different end chapter_index", state.chapter_index, " - range_index", i)
-                    print(">>>>>> ",math.abs(current_range['end'] - next_range['end']),"with", readable(current_range['end']), "and", readable(next_range['end']))
-                end
-            else
-                print("same start but different end")
-                print("current range index: ", state.range_index, "next range index: ", i)
-                print(">>>>>> ",math.abs(current_range.start - next_range.start),"with", readable(current_range.start), "and", readable(next_range.start))
-                --msg.error("Not dupe, different start", readable(current_range.start)," - ", readable(next_range.start))
-            end
-        end
-        -- Case: Overlap same start
-        if math.abs(current_range.start - next_range.start) <= 0.5 then
-            msg.debug("Case: Overlap same start")
-            local current_length = current_range['end'] - current_range.start
-            local next_length = next_range['end'] - next_range.start
-            
-            if current_length > next_length then
-                table.insert(segment_cache, state.range_index, next_range)
-                table.remove(segment_cache, state.range_index + 2)
-                table.insert(chapter_list, state.chapter_index, next_range.start_chapter)
-                table.insert(chapter_list, state.chapter_index + 1, next_range.end_chapter)
-                table.remove(chapter_list, state.chapter_index + 4)
-                table.remove(chapter_list, state.chapter_index + 4)
-                current_range = segment_cache[state.range_index]
-                next_range = segment_cache[state.range_index + 1]
-            else
-                msg.debug("Current segment not enclosing next segment:", readable(current_length)," < ", readable(next_length))
-                msg.debug("Keeping shorter segment and showing the end of the longer segment")
-
-                -- since the segments have the same start but next_segment ends outside of current_segment
-                -- we let the next segment start at the end of current segment.
-                next_range.start = current_range['end']
-                --if next_range.start_chapter then
-                -- we also need to move the actual chapter to the time of current segment end
-                next_range.start_chapter.time = current_range.end_chapter.time
-                --end
-                -- Remove redundant chapter created by overlapping starts, if present
-                local redundant_idx = state.chapter_index + 1
-                if chapter_list[redundant_idx] and math.abs((chapter_list[redundant_idx].time or -1) - next_range.start) <= 0.001 then
-                    msg.debug("Redundant chapter found and removed")
-                    table.remove(chapter_list, redundant_idx)
-                end
-            end
-
-            return true
-        end
-        -- Case: Overlap different starts
-        local overlap_start = current_range['end'] - next_range.start
-        local overlap_end = current_range['end'] - next_range['end']
-        
-        if overlap_start > 0 and overlap_end > 0 then
-            print("overlap different starts")
-            -- next_range completely inside current_range; trim current_range to end at next_range.start
-            current_range['end'] = next_range.start
-            if current_range.end_chapter then
-                current_range.end_chapter.time = next_range.start
-            end
-            return true
-            
-        elseif overlap_start > 0 and overlap_end <= 0 then
-            print("overlap different ends")
-            -- next_range ends after current_range; trim current_range to end at next_range.start
-            local new_end = next_range.start
-            if new_end < current_range.start then
-                new_end = current_range.start
-            end
-            current_range['end'] = new_end
-            if current_range.end_chapter then
-                current_range.end_chapter.time = new_end
-            end
-            return true
-        end
-        
-        --print("12")
-    end
-    -- Case: Chapter snapping
-    if is_sponsor_start or is_sponsor_end then
-        --print("4")
-        local prev_chapter = chapter_list[state.chapter_index - 1]
-        local snap_chapter = nil
-        local segment_time = is_sponsor_start and current_range.start or current_range['end']
-        local new_title = is_sponsor_start and current_chapter.title or "end"
-        
-        -- Check previous chapter
-        if prev_chapter and math.abs(prev_chapter.time - segment_time) <= 5.0 then
-            msg.debug("prev_chapter snap")
-            local prev_range = segment_cache[state.range_index - 1]
-            if not prev_range or prev_range.end_chapter ~= prev_chapter then
-                snap_chapter = prev_chapter
-            end
-        end
-        --print("5")
-        -- Check next chapter
-        if not snap_chapter and next_chapter and math.abs(next_chapter.time - segment_time) <= 5.0 then
-            msg.debug("next_chapter snap")
-            if not next_range or next_range.start_chapter ~= next_chapter then
-                snap_chapter = next_chapter
-            end
-        end
-        --print("6")
-        -- Snap to found chapter but not to other sponsor segment or own boundary
-        -- NOTE: "not a == b" in Lua evaluates as (not a) == b. Use ~= for inequality.
-        if snap_chapter
-            and (not next_range or snap_chapter.time ~= next_range.start)
-            and not (is_sponsor_start and snap_chapter == current_range.end_chapter)
-            and not (is_sponsor_end and snap_chapter == current_range.start_chapter)
-            and (
-                (is_sponsor_start and match_category(snap_chapter.title))
-                or (is_sponsor_end and snap_chapter.title == "end")
-            ) then
-            print("snap to found chapter")
-            if is_sponsor_start then
-                current_range.start = snap_chapter.time
-                -- Remove the old start chapter that current_chapter pointed to
-                table.remove(chapter_list, state.chapter_index)
-                current_range.start_chapter = snap_chapter
-            else
-                current_range['end'] = snap_chapter.time
-                -- Remove the old end chapter that current_chapter pointed to
-                table.remove(chapter_list, state.chapter_index)
-                current_range.end_chapter = snap_chapter
-            end
-            return true
-        elseif snap_chapter then
-            msg.debug("Snap was armed but wasn't done")
-        end
-    end
-
-    
-    if is_sponsor_end then
-        -- Do not retitle 'end' markers inline; retain existing boundary semantics
-        -- Case: Adjacent segments (end aligns to next start; keep the existing end title)
-        if next_range and math.abs(current_range['end'] - next_range.start) <= 0.5 then
-            msg.debug("Adjacent segments", current_range.start_chapter.title, readable(current_range['end']), next_range.start_chapter.title, readable(next_range.start))
-            local boundary_time = next_range.start
-            current_range['end'] = boundary_time
-            -- Remove duplicate 'end' only if previous chapter is non-sponsor and has same time
-            local removed = false
-            local prev = chapter_list[state.chapter_index - 1]
-            if prev and not match_category(prev.title) and math.abs((prev.time or -1) - boundary_time) <= 0.0005 then
-                table.remove(chapter_list, state.chapter_index)
-                removed = true
-            end
-            -- Keep end_chapter reference consistent at boundary time
-            if current_range.end_chapter then current_range.end_chapter.time = boundary_time end
-            -- Avoid re-processing same boundary: advance if nothing was removed
-            if not removed then
-                state.chapter_index = state.chapter_index + 1
-            end
-            return true
-        end
-
-        -- Replace 'end' marker title only if previous chapter is non-sponsor
-        if current_chapter.title == "end" then
-            msg.debug("Replacing end_marker with last viable title:", state.last_viable_title)
-            current_chapter.title = state.last_viable_title
-        else
-            msg.debug("Segment_end but no end_marker:", current_chapter.title)
-        end
-    end
-
-
-    --print("15")
-    --TODO: check if the next range would also aplply to the current chapter. if yes change state.range_index and return true
-    if next_range and (current_chapter.time == next_range.start or math.abs(current_chapter.time - next_range.start) <= 0.5) then 
-        msg.debug("Next Segment also could apply to current chapter, because segment start time matches chapter time")
-        state.range_index = state.range_index + 1
-        return true
-    else
-        msg.debug("No next segment or next segment does not apply to current chapter")
-    end
-
-
-    msg.debug("Chapter", state.chapter_index, "got to the end with segment_index", state.range_index)
-    state.chapter_index = state.chapter_index + 1
-        --TODO: this shit does not work as it does not handle duplicates (finds the first and ignores the rest.), 
-    -- the code should work without this but that is enven more borked.
-    while state.range_index <= #segment_cache do
-        local current_range = segment_cache[state.range_index]
-        if current_chapter.time < current_range.start then break end
-        if current_chapter.time > current_range['end'] then 
-            state.range_index = state.range_index + 1
-        else
-            break
-        end
-    end
-    return true
-end
-local function activate_sponsorblock()  
-    
-    -- Build initial cache from existing chapters
-    num_seg_found = init_segment_cache()
-    -- Create chapters for new segments
-
-    -- for delte local chapter
-    --if true then
-    --    segment_cache = {}
-    --    chapter_list = {}
-    --end
-
-    
-    for i, segment in pairs(sponsor_data or {}) do
-        msg.debug("segment", utils.format_json(segment))
-
-
-        local start_title = "[SponsorBlock]: " .. process_category(segment.category)
-        local start_chapter = {title = start_title, time = segment.segment[1]}
-        local end_chapter = {title = "end", time = segment.segment[2]}
-        local delta = end_chapter.time - start_chapter.time
-        if delta > options.min_segment_length then
-            table.insert(chapter_list, start_chapter)
-            -- if the end coincides with next segment's start, we will not add a duplicate end marker now
-            table.insert(chapter_list, end_chapter)
-
-            -- add the segment to the cache. 
-            table.insert(segment_cache, {
-                start_chapter = start_chapter,
-                end_chapter = end_chapter,
-                start = segment.segment[1],
-                ['end'] = segment.segment[2],
-                title = segment.category,
-                category = process_category(segment.category),
-            })
-        end
-    end
-    table.sort(chapter_list, function(a, b) return a.time < b.time end)
-    for i, chapter in ipairs(chapter_list) do
-        print("chapter", i, chapter.title, readable(chapter.time))
-    end
-
-    table.sort(segment_cache, function(a, b) return a.start_chapter.time < b.start_chapter.time end)
-
-    for i, segment in ipairs(segment_cache) do
-        print("segment", i, segment.start, segment['end'], segment.start_chapter.title, "endtitle:", segment.end_chapter and segment.end_chapter.title)
-    end
-        -- Reset processing state and run main loop
-        state.chapter_index = 1
-        state.range_index = 1
-    while state.chapter_index <= #chapter_list do
-        if not processChapterInLoop(state) then break end
-    end
-
-    -- Removed normalize_after_processing(); keep existing chapters intact and rely on in-loop adjustments
-    --print("segment_cache", utils.format_json(segment_cache))
-    for i, segment in ipairs(segment_cache) do
-        print("segment", i, segment.start, segment['end'], segment.start_chapter.title, "endtitle:" , segment.end_chapter and segment.end_chapter.title)
-    end
-
-    for i, chapter in ipairs(chapter_list) do
-        print("chapter", i, chapter.title, chapter.time)
-    end
-
-    -- Rebuild cache after adding new chapters
-    num_seg_found = #segment_cache
-    --button_badge = num_seg_found
-    --if not num_seg_found then return end
+    -- Write back the updated chapter list
+    mp.set_property_native("chapter-list", chapter_list)
 
     ON = true
     update_button()
-    -- Write back the updated chapter list
-    mp.set_property_native("chapter-list", chapter_list)
     mp.observe_property("chapter", "number", skip_current_chapter)
     mp.add_forced_key_binding("b","sponsorblock",toggle)
 end
@@ -610,15 +582,6 @@ local function pull_sponsorskip_data()
     end
 end
 
-local function has_local_sponsorblock_chapters()
-    for _, chapter in ipairs(chapter_list) do
-        if chapter.title and match_category(chapter.title) then
-            return true
-        end
-    end
-    return false
-end
-
 local function file_loaded()
     msg.debug("file_loaded")
     -- Reset data
@@ -628,12 +591,11 @@ local function file_loaded()
     num_seg_found = nil
     hide_button()
     duration = mp.get_property_native("duration") or 0
-    chapter_list = mp.get_property_native("chapter-list", {})
-    state.last_viable_title = mp.get_property("media-title")
     
-    ---- Try to pull data from server first
-    --if pull_sponsorskip_data() then
+    -- Try to pull data from server
     pull_sponsorskip_data()
+    
+    -- Activate (will merge with existing chapters)
     activate_sponsorblock()
 end
 
@@ -641,4 +603,3 @@ mp.register_event("file-loaded", file_loaded)
 
 -- hide on init (for idle)
 hide_button()
---TODO: better stream detection
