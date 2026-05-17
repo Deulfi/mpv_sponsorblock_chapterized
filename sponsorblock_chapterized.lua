@@ -26,6 +26,7 @@ local options = {
     skip_unknown = false,
     min_segment_length = 1,
     time_tolerance = 0.1, -- Just floating point safety, no longer needed for baked/fresh matching
+    experimental_use_ytdl_hook_data = false,
 }
 opt.read_options(options)
 
@@ -70,7 +71,7 @@ for cat in options.categories:gsub('%s', ''):gmatch('[^,]+') do
 end
 
 local function match_category(title)
-    mp.msg.debug("match_category", title, "-" , title:match('^"?%[SponsorBlock%]: (.-)\"?$') or false)
+    mp.msg.trace("match_category", title, "-" , title:match('^"?%[SponsorBlock%]: (.-)\"?$') or false)
     return title and title:match('^"?%[SponsorBlock%]: (.-)\"?$') or false
 end
 
@@ -519,6 +520,22 @@ local function extract_youtube_id()
     return nil
 end
 
+--MARK: extract sponsor data
+local function extract_sponsorskip_data()
+    local json_results = mp.get_property_native("user-data/mpv/ytdl/json-subprocess-result")
+    local stdout_value = json_results["stdout"]
+    local raw_data = utils.parse_json(stdout_value)["sponsorblock_chapters"]
+    if not raw_data then return false end
+    sponsor_data = {}
+    for _, dataset in ipairs(raw_data) do
+        table.insert(sponsor_data, {
+            segment = {dataset["start_time"], dataset["end_time"]},
+            category = dataset["category"]
+        })
+    end
+    return true
+end
+
 --MARK: pull sponsor data
 local function pull_sponsorskip_data()
     local youtube_id = extract_youtube_id()
@@ -596,7 +613,6 @@ local function file_loaded()
     duration = mp.get_property_native("duration") or 0
     -- Get existing chapters
     chapter_list = mp.get_property_native("chapter-list", {})
-    
 
     if is_local_file() then
         msg.debug("Sponsorblock: Local file detected, trying to extract segments from local file")
@@ -620,16 +636,27 @@ local function file_loaded()
             return
         end
     elseif is_youtube() then
+        if options.experimental_use_ytdl_hook_data then
+            msg.debug("Sponsorblock: Trying to extract sponsorblock data from ytdl hook property")
+            local result = extract_sponsorskip_data()
+            if not result then
+                msg.debug("Sponsorblock: Failed to extract data from ytdl hook property, aborting")
+                return
+            end
+        else
             msg.debug("Sponsorblock: Youtube stream detected, trying to pull data from server")
             local result = pull_sponsorskip_data()
+            mp.msg.debug(utils.to_string(sponsor_data))
             if not result then
                 msg.debug("Sponsorblock: Failed to pull data from server (or no data for the video found), aborting")
                 return
             end
+        end
     else
         msg.debug("Sponsorblock: Not a youtube stream, aborting")
+        return
     end
-    msg.info("Sponsorblock: blockable chapters found, engaging Sponsorblock")
+    msg.info("Sponsorblock: blockable chapters found, engaging Skipdrive")
     -- Activate (will merge with existing chapters)
     activate_sponsorblock(true)
 end
@@ -652,6 +679,11 @@ mp.register_script_message('manual_sponsorblock_pull', function()
     activate_sponsorblock()
 end)
 
+if options.experimental_use_ytdl_hook_data then
+    local opts = mp.get_property_native("ytdl-raw-options") or {}
+    opts["sponsorblock-mark"] = "all"
+    mp.set_property_native("ytdl-raw-options", opts)
+end
 
 -- hide on init (for idle)
 hide_button()
