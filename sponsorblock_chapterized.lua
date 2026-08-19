@@ -441,9 +441,9 @@ local function skip_current_chapter()
     local now = mp.get_time()
     skip_times[skip_index] = now
     skip_index = skip_index % 5 + 1
-    local oldest_idx = (skip_index + 3) % 5 + 1
-    if skip_times[oldest_idx] > 0 and now - skip_times[oldest_idx] < 0.2 then
-        return -- Too many calls in 0.2s, debounce
+	
+    if now - skip_times[skip_index] < 0.2 then
+        return -- Too many calls, debounce
     end
 
     local cur_chapter_index = mp.get_property_number("chapter")
