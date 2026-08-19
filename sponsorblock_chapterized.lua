@@ -9,7 +9,6 @@ local segment_cache = {} -- Array of {start, end, category, start_idx, end_idx}
 local chapter_list = {}
 local duration = 0
 local keep_local_segments = false
-local extracted_segmets = {}
 
 local options = {
 	server = "https://sponsor.ajay.app/api/skipSegments",
@@ -195,12 +194,13 @@ end
 --MARK: merge segments
 local function merge_segments()
     -- clean up in case there were local ones and the user manual sponsorblock pulled
-    for i, chapter in ipairs(chapter_list) do
-        local category = match_category(chapter.title)
-        if category then
-            table.remove(chapter_list, i)
+    local clean = {}
+    for _, ch in ipairs(chapter_list) do
+        if not match_category(ch.title) then
+            table.insert(clean, ch)
         end
     end
+    chapter_list = clean
 
     if not sponsor_data then return end
     -- Build fresh segments from API
@@ -441,9 +441,9 @@ local function skip_current_chapter()
     local now = mp.get_time()
     skip_times[skip_index] = now
     skip_index = skip_index % 5 + 1
-    
-    if now - skip_times[skip_index] < 0.2 then
-        return -- Too many calls, debounce
+    local oldest_idx = (skip_index + 3) % 5 + 1
+    if skip_times[oldest_idx] > 0 and now - skip_times[oldest_idx] < 0.2 then
+        return -- Too many calls in 0.2s, debounce
     end
 
     local cur_chapter_index = mp.get_property_number("chapter")
@@ -493,6 +493,7 @@ local function activate_sponsorblock(merge)
     ON = true
     update_button()
     mp.observe_property("chapter", "number", skip_current_chapter)
+    mp.remove_key_binding("sponsorblock")
     mp.add_forced_key_binding("b","sponsorblock", toggle)
 end
 
@@ -524,7 +525,9 @@ end
 local function extract_sponsorskip_data()
     local json_results = mp.get_property_native("user-data/mpv/ytdl/json-subprocess-result")
     local stdout_value = json_results["stdout"]
-    local raw_data = utils.parse_json(stdout_value)["sponsorblock_chapters"]
+    local parsed = utils.parse_json(stdout_value)
+    if not parsed then return false end
+    local raw_data = parsed["sponsorblock_chapters"]
     if not raw_data then return false end
     sponsor_data = {}
     for _, dataset in ipairs(raw_data) do
