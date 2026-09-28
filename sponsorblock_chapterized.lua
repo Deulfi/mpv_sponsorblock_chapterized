@@ -8,7 +8,6 @@ local options = {
     show_only_cats = "intro, outro, music_offtopic, preview, poi_highlight, filler, exclusive_access",
     show_msg_duration = 3,
     skip_unknown = false,
-    time_tolerance = 0.1,
 }
 
 for key, value in pairs(options) do
