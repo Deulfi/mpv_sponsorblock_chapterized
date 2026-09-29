@@ -32,3 +32,4 @@ Configuration in `sponsorblock_chapterized.conf`:
 ## Links
 
 - Original mpv sponsorblock: https://github.com/po5/mpv_sponsorblock
+- SponsorBlock: https://github.com/ajayyy/SponsorBlock
