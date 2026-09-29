@@ -1,21 +1,21 @@
-Minimal SponsorBlock integration for UOSC chapter bar highlighting.
+# SponsorBlock Chapter Integration for mpv with UOSC
 
-**Data sources:**
-1. ytdl_hook — primary, fetches sponsor data from SponsorBlock API
-2. Embedded chapters — works with pre-existing `[SponsorBlock]:` chapters
+Adds SponsorBlock segments from ytdl-hook data as chapters for uosc seekbar highlighting. Skips active sponsor segments while playing based on the timestamps of the provided segments.
 
-**No:** curl API calls, no hash prefix, no caching. Simple and direct.
+The script can be toggled off and on with `b` when the video has sponsor segments.
 
-**Key features:**
-- Timer-based segment checking (checks every 0.2s)
-- `categories` — which categories to skip
-- `show_only_cats` — mark but don't skip
-- UOSC button support (`button:Sponsorblock_Button` in uosc.conf)
-- Toggle on/off with `b`
+## Options
 
-**Prerequisites:**
-- ytdl_hook (for API data) or pre-existing `[SponsorBlock]:` chapters
+Configuration in `sponsorblock_chapterized.conf`:
 
-Links:
+| Option | Description |
+|--------|-------------|
+| `categories` | Comma-separated categories to skip (use `_` for spaces) |
+| `show_only_cats` | Comma-separated categories to mark but not skip |
+| `skip_unknown` | Skip segments not in configured categories |
+| `show_msg_duration` | Duration of OSD skip messages (seconds) |
+
+## Links
+
 - Original mpv sponsorblock: https://github.com/po5/mpv_sponsorblock
-- SponsorBlock API: https://github.com/ajayyy/SponsorBlock
+- SponsorBlock: https://github.com/ajayyy/SponsorBlock
