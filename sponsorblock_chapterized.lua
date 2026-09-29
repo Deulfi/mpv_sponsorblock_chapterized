@@ -234,28 +234,25 @@ local function merge_segments()
     end
 
     if not sponsor_data then return end
-    -- Validate sponsor_data has proper structure
-    if type(sponsor_data) ~= "table" then msg.error("Sponsorblock: sponsor_data is not a table"); return end
     -- Build fresh segments from API
 
     msg.debug("Sponsorblock: sponsor_data:", utils.to_string(sponsor_data))
 
     local fresh_segments = {}
     for _, segment in pairs(sponsor_data) do
-        -- Guard: skip segments with missing or invalid end time
+        -- Guard: skip segments with missing end to prevent nil cascade
         if not segment.segment or not segment.segment[1] or not segment.segment[2] then
             msg.debug("Sponsorblock: skipping invalid segment entry:", segment)
-            goto continue
+        else
+            local delta = segment.segment[2] - segment.segment[1]
+            if delta > options.min_segment_length then
+                table.insert(fresh_segments, {
+                    start = segment.segment[1],
+                    ['end'] = segment.segment[2],
+                    category = string.lower(segment.category):gsub('_', ' '),
+                })
+            end
         end
-        local delta = segment.segment[2] - segment.segment[1]
-        if delta > options.min_segment_length then
-            table.insert(fresh_segments, {
-                start = segment.segment[1],
-                ['end'] = segment.segment[2],
-                category = string.lower(segment.category):gsub('_', ' '),
-            })
-        end
-        ::continue::
     end
 
     -- Remove duplicates (same start and end within tolerance)
@@ -275,12 +272,6 @@ local function merge_segments()
     -- Handle overlaps
     local final_segments = {}
     for _, seg in ipairs(fresh_segments) do
-        -- Guard: skip segments missing end to prevent nil cascade
-        if not seg or not seg['end'] or not seg.start then
-            msg.debug("Sponsorblock: skipping invalid segment in overlap handling")
-            goto nextseg
-        end
-        ::nextseg::
         if #final_segments == 0 then
             table.insert(final_segments, seg)
         else
@@ -302,9 +293,6 @@ local function merge_segments()
         -- avoids leftover uploader chapters marking sponsor/ad content
         local inside_segment = false
         for _, seg in ipairs(final_segments) do
-            -- Guard: skip segments with invalid times
-            if not seg or not seg.start or not seg['end'] then goto nextseg_inside end
-            ::nextseg_inside::
             if chapter.time > seg.start + options.time_tolerance and
                chapter.time < seg['end'] - options.time_tolerance then
                 inside_segment = true
@@ -332,12 +320,6 @@ local function merge_segments()
     local used_preserved_as_end = {}
     
     for _, seg in ipairs(final_segments) do
-        -- Guard: skip segments without end time (prevents nil-time chapter corruption)
-        if not seg or not seg['end'] then
-            msg.debug("Sponsorblock: skipping segment without end time:", seg and seg.category or "nil")
-            goto nextseg2
-        end
-        ::nextseg2::
         -- Add start chapter
         local start_chapter = {title = "[SponsorBlock]: " .. seg.category, time = seg.start}
         table.insert(chapter_list, start_chapter)
@@ -402,12 +384,6 @@ local function merge_segments()
         -- A segment's own start and end should never be merged
         local small_tol = 0.01  -- Small tolerance for floating point comparison
         for _, seg in ipairs(final_segments) do
-            -- Guard: skip segments with invalid times to prevent nil cascade
-            if not seg or not seg.start or not seg['end'] then
-                msg.debug("Sponsorblock: skipping segment without valid times")
-                goto nextseg_boundary
-            end
-            ::nextseg_boundary::
             if (math.abs(prev.time - seg.start) <= small_tol and math.abs(curr.time - seg['end']) <= small_tol) or
                (math.abs(curr.time - seg.start) <= small_tol and math.abs(prev.time - seg['end']) <= small_tol) then
                 return true
@@ -453,9 +429,6 @@ end
 local function get_actionable_segment(start_time, chapter_index)
     local segment
     for i, range in ipairs(segment_cache) do
-        -- Guard: skip segments missing end to prevent nil cascade
-        if not range or not range['end'] or not range.start then goto next_action end
-        ::next_action::
         -- Subtract a tiny amount to avoid edge-case matching at exact segment end boundary
         if range.start <= start_time and (start_time < (range['end'] - 0.0005)) then
             segment = range
@@ -497,8 +470,6 @@ local function skip_current_chapter()
 
     local segment = get_actionable_segment(chapter_time, cur_chapter_index)
     if not segment then return end
-    -- Guard: nil end would corrupt skip_to calculation
-    if not segment['end'] then return end
 
     -- Debounce: track attempts per position. If the chapter_time hasn't
     -- meaningfully changed since the last skip, we're likely being held
