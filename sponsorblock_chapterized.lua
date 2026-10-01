@@ -1,15 +1,35 @@
+-- SponsorBlock Chapterized (mpv Lua)
+--
+-- Turns SponsorBlock skip data into mpv chapters, and auto-skips those
+-- segments during playback. A segment lives in the chapter list as
+-- "[SponsorBlock]: <category>" chapters; rebuilding segment_cache from those
+-- chapters is what drives the skipping (see rebuild_segment_cache).
+--
+-- Two data sources:
+--   • local files – SponsorBlock chapters baked into the media itself
+--     (no network involved); only nearby-boundary deduplication is applied
+--   • YouTube – fresh data from a ytdl_hook hook result or the SponsorBlock
+--     server (curl fallback); that data is merged into the existing chapters
+--
+-- Flow: file_loaded → fetch/parse → rebuild chapter list → activate_sponsorblock
+--       → observe "chapter" property → skip_current_chapter seeks past segments
+
 local mp = require 'mp'
+-- Configuration loader and utilities
 local opt = require 'mp.options'
 local utils = require 'mp.utils'
 local msg = require 'mp.msg'
 
-local ON = false
-local sponsor_data = nil
-local segment_cache = {} -- Array of {start, end, category, start_idx, end_idx}
-local chapter_list = {}
-local duration = 0
-local keep_local_segments = false
+-- Global state for the current media.
+local enabled = false        -- whether auto-skip is enabled right now
+local sponsor_data = nil     -- raw segments from the API or ytdl hook
+local segment_cache = {}     -- {start, end, category, start_idx, end_idx}, rebuilt
+                             -- from chapter_list (rebuild_segment_cache); the
+                             -- actual source of truth for the skip logic
+local chapter_list = {}      -- mpv's chapter list as it is being maintained
+local duration = 0           -- media duration in seconds
 
+-- Options (configurable via config file under this script's name)
 local options = {
     server = "https://sponsor.ajay.app/api/skipSegments",
     categories = "",
@@ -31,6 +51,9 @@ local options = {
 
 opt.read_options(options, mp.get_script_name())
 
+-- URL formats the video ID can be pulled from: ytdl_hook hook paths and
+-- plain YouTube links (see extract_youtube_id, which also checks the
+-- Referer header and PURL metadata).
 local yt_patterns = {
     "ytdl://youtu%.be/([%w-_]+)",
     "ytdl://w?w?w?%.?youtube%.com/v/([%w-_]+)",
@@ -42,16 +65,13 @@ local yt_patterns = {
     "%[([%w-_]+)%]%.",
 }
 
+-- Command string the UOSC button runs (sent to this script).
 local button_command = "script-message sponsorblock toggle"
-local num_seg_found
+local num_seg_found -- segment count shown as the button badge; nil before first scan
 
---MARK: Helper functions
--- Helper function to process category names consistently
-local function process_category(cat)
-    return cat:gsub("^%l", string.upper):gsub("_", " ")
-end
-
-local function parsed_categories(cats_to_parse)
+-- Turns a comma-separated option into the quoted list the API expects,
+-- e.g. "sponsor, selfpromo" → '"sponsor","selfpromo"'.
+local function parsed_cats(cats_to_parse)
     if cats_to_parse == "" then return "" end
     local cats = {}
     for cat in cats_to_parse:gsub('%s', ''):gmatch('[^,]+') do
@@ -60,30 +80,26 @@ local function parsed_categories(cats_to_parse)
     return table.concat(cats, ",")
 end
 
--- Build show_only lookup table once with processed category names
+-- Set-membership lookups, built once from the options and keyed by
+-- lowercase name with underscores replaced by spaces (the same normalization
+-- get_actionable_segment applies to segment categories):
+--   show_only_lookup     – mark-only categories: shown as chapters, never skipped
+--   skip_categories_lookup – categories that are actively skipped
 local show_only_lookup = {}
 for cat in options.show_only_cats:gsub('%s', ''):gmatch('[^,]+') do
     show_only_lookup[string.lower(cat:gsub('_', ' '))] = true
 end
-local cats_lookup = {}
+local skip_cats_lookup = {}
 for cat in options.categories:gsub('%s', ''):gmatch('[^,]+') do
-    cats_lookup[string.lower(cat:gsub('_', ' '))] = true
+    skip_cats_lookup[string.lower(cat:gsub('_', ' '))] = true
 end
 
-local function match_category(title)
+-- Returns the category name of a SponsorBlock chapter title
+-- ("[SponsorBlock]: <category>", with or without extra quotes), else false.
+-- This is the core "is this chapter an SB boundary?" test used everywhere.
+local function match_cat(title)
     msg.trace("match_category", title, "-", title:match('^"?%[SponsorBlock%]: (.-)\"?$') or false)
     return title and title:match('^"?%[SponsorBlock%]: (.-)\"?$') or false
-end
-
--- Find chapter index by time (with tolerance)
-local function find_chapter_by_time(time, tolerance)
-    tolerance = tolerance or 0.5
-    for i, chapter in ipairs(chapter_list) do
-        if math.abs(chapter.time - time) <= tolerance then
-            return i
-        end
-    end
-    return nil
 end
 
 local function is_youtube()
@@ -98,17 +114,21 @@ local function is_local_file()
     return path:match("^/") or path:match("^[A-Za-z]:\\")
 end
 
+-- Syncs the status button with current state (enabled/disabled icon,
+-- segment-count badge). Talks to the ucm minimal plugin or UOSC depending
+-- on the use_ucm_plugin option. This is the visual indicator only; the
+-- 'b' keybinding is what actually toggles skipping.
 local function update_button()
     if not options.uosc_button then return end
-    -- if not ON then return end
+    -- if not enabled then return end
     num_seg_found = #segment_cache
     if options.use_ucm_plugin then
-        mp.commandv('script-message-to', 'ucm_sponsorblock_minimal_plugin', 'update-button', tostring(ON), tostring(num_seg_found))
+        mp.commandv('script-message-to', 'ucm_sponsorblock_minimal_plugin', 'update-button', tostring(enabled), tostring(num_seg_found))
         return
     end
-    
+
     local button = {
-        icon = ON and options.button_enabled_icon or options.button_disabled_icon,
+        icon = enabled and options.button_enabled_icon or options.button_disabled_icon,
         badge = options.show_sponsor_count and num_seg_found or nil,
         tooltip = options.button_tooltip,
         command = button_command,
@@ -117,6 +137,8 @@ local function update_button()
     mp.commandv('script-message-to', 'uosc', 'set-button', 'Sponsorblock_Button', utils.format_json(button))
 end
 
+-- Clears the button (called on script init for the idle screen and at the
+-- start of every file load, before data is known).
 local function hide_button()
     if not options.uosc_button then return end
     if options.use_ucm_plugin then
@@ -126,25 +148,29 @@ local function hide_button()
     mp.commandv('script-message-to', 'uosc', 'set-button', 'Sponsorblock_Button', utils.format_json({icon = "", hide = true}))
 end
 
--- Rebuild segment_cache from chapter_list (source of truth)
--- This ensures consistency after any modifications
---MARK: segment cache
+--MARK: Segment cache
+--
+-- Derives segment_cache from the chapters: each "[SponsorBlock]:" chapter
+-- starts a segment, and the *next* chapter's time is that segment's end
+-- (or the end of the file for the last chapter). segment_cache is what the
+-- skip logic and the button badge read, so it must be rebuilt every time the
+-- chapter list changes shape.
 local function rebuild_segment_cache()
     segment_cache = {}
     num_seg_found = 0
-    
+
     for i, chapter in ipairs(chapter_list) do
-        local category = match_category(chapter.title)
-        if category then
+        local cat = match_cat(chapter.title)
+        if cat then
             local next_chapter = chapter_list[i + 1]
             local end_time = next_chapter and next_chapter.time or duration - 0.001
-            
+
             -- Check for valid segment
             if end_time > chapter.time then
                 table.insert(segment_cache, {
                     start = chapter.time,
                     ['end'] = end_time,
-                    category = category,
+                    category = cat,
                     start_idx = i,
                     end_idx = next_chapter and (i + 1) or nil,
                 })
@@ -152,46 +178,21 @@ local function rebuild_segment_cache()
             end
         end
     end
-    
+
+    -- Log the rebuilt segments for debugging, and report whether anything was found.
     msg.info("segment_cache: " .. #segment_cache .. " segments"); for _, seg in ipairs(segment_cache) do msg.info("  " .. seg.category .. " [" .. seg.start .. " -> " .. seg["end"] .. "]"); end; return num_seg_found > 0
 end
 
--- Find or create chapter at time (with tolerance matching)
---MARK: find or create ch
-local function find_or_create_chapter(time, title, tolerance)
-    tolerance = tolerance or options.time_tolerance
-    
-    -- First, try to find existing chapter within tolerance
-    local idx = find_chapter_by_time(time, tolerance)
-    
-    if idx then
-        local existing = chapter_list[idx]
-        -- If we're adding a SponsorBlock chapter, replace normal chapter
-        if title and match_category(title) and not match_category(existing.title) then
-            chapter_list[idx] = {title = title, time = time}
-            return idx
-        end
-        -- Both SB or both normal: keep existing
-        return idx
-    end
-    
-    -- Create new chapter at correct position
-    local insert_pos = #chapter_list + 1
-    for i, chapter in ipairs(chapter_list) do
-        if chapter.time > time then
-            insert_pos = i
-            break
-        end
-    end
-    
-    table.insert(chapter_list, insert_pos, {title = title, time = time})
-    return insert_pos
-end
-
--- Merge baked-in segments with fresh segments
--- Called for local segments to merge overlapping chapter boundaries
+--MARK: Chapter merging
+--
+-- Local files only: dedupes chapters that landed within
+-- nearby_merge_tolerance of each other (e.g. re-encoded chapters drifted a
+-- fraction of a second). The tricky bit is an SB chapter sitting next to a
+-- normal one: if the chapter *after* the SB one is SB as well, the SB chapter
+-- is a segment START (keep it, drop the normal neighbor); otherwise it's a
+-- segment END marker, which is dropped so the boundary folds into the normal
+-- chapter.
 local function merge_nearby_chapters()
-    -- Sort by time
     table.sort(chapter_list, function(a, b) return a.time < b.time end)
 
     for i = #chapter_list, 2, -1 do
@@ -199,11 +200,11 @@ local function merge_nearby_chapters()
         local prev = chapter_list[i - 1]
         if math.abs(curr.time - prev.time) <= options.nearby_merge_tolerance then
             -- Both are SponsorBlock: keep both (distinct segment boundaries)
-            if match_category(curr.title) and match_category(prev.title) then
+            if match_cat(curr.title) and match_cat(prev.title) then
                 -- Do nothing: both are segment boundaries, keep them
             -- SB + normal (SB is curr): remove SB if it's a segment END
-            elseif match_category(curr.title) and not match_category(prev.title) then
-                if match_category(chapter_list[i + 1] and chapter_list[i + 1].title) then
+            elseif match_cat(curr.title) and not match_cat(prev.title) then
+                if match_cat(chapter_list[i + 1] and chapter_list[i + 1].title) then
                     -- curr is segment START: keep it, remove normal prev
                     table.remove(chapter_list, i - 1)
                 else
@@ -212,7 +213,7 @@ local function merge_nearby_chapters()
                 end
             -- Normal + SB (normal is curr, SB is prev): keep both
             -- (normal chapter after SB should not be subsumed into SB boundary)
-            elseif not match_category(curr.title) and match_category(prev.title) then
+            elseif not match_cat(curr.title) and match_cat(prev.title) then
                 -- Do nothing: keep both chapters
             -- Both normal: remove duplicate
             else
@@ -223,24 +224,42 @@ local function merge_nearby_chapters()
         end
     end
 end
---MARK: merge segments
+-- Merges freshly fetched SponsorBlock segments (sponsor_data) into the
+-- existing chapter list.
+--
+-- Pipeline:
+--   1. clear old SB chapters from the list
+--   2. build fresh segments from sponsor_data (drop malformed entries and
+--      anything shorter than min_segment_length)
+--   3. dedupe near-identical segments, then resolve overlaps by keeping the
+--      wider segment
+--   4. preserve non-SB chapters that fall *outside* the segments – dropping
+--      ones inside them, because those are usually the uploader's own
+--      "sponsor" chapters
+--   5. rebuild the list: preserved chapters + SB boundary chapters; a
+--      preserved chapter that already sits on a segment end is reused as that
+--      boundary instead of being duplicated
+--   6. sort and do a final near-duplicate merge, which must never merge a
+--      segment's own start/end pair
 local function merge_segments()
-    -- clean up in case there were local ones and the user manual sponsorblock pulled
+    -- Wipe previously created SB chapters so this run's merge is the only one
+    -- (also covers the case where local ones were present before a manual
+    -- re-pull).
     for i, chapter in ipairs(chapter_list) do
-        local category = match_category(chapter.title)
+        local category = match_cat(chapter.title)
         if category then
             table.remove(chapter_list, i)
         end
     end
 
     if not sponsor_data then return end
-    -- Build fresh segments from API
 
     msg.debug("Sponsorblock: sponsor_data:", utils.to_string(sponsor_data))
 
+    -- Step 2: normalize API segments (category lowercased, underscores →
+    -- spaces, so it matches the lookup tables' keys).
     local fresh_segments = {}
     for _, segment in pairs(sponsor_data) do
-        -- Guard: skip segments with missing end to prevent nil cascade
         if not segment.segment or not segment.segment[1] or not segment.segment[2] then
             msg.debug("Sponsorblock: skipping invalid segment entry:", segment)
         else
@@ -255,7 +274,7 @@ local function merge_segments()
         end
     end
 
-    -- Remove duplicates (same start and end within tolerance)
+    -- Step 3a: drop exact duplicates (within 0.5s on both ends).
     for i = #fresh_segments, 2, -1 do
         for j = i - 1, 1, -1 do
             if math.abs(fresh_segments[i].start - fresh_segments[j].start) <= 0.5 and
@@ -265,11 +284,10 @@ local function merge_segments()
             end
         end
     end
-    
-    -- Sort by start time
+
     table.sort(fresh_segments, function(a, b) return a.start < b.start end)
 
-    -- Handle overlaps
+    -- Step 3b: overlapping segments – keep the wider one.
     local final_segments = {}
     for _, seg in ipairs(fresh_segments) do
         if #final_segments == 0 then
@@ -285,8 +303,9 @@ local function merge_segments()
             end
         end
     end
-    
-    -- Preserve non-SponsorBlock chapters, rebuild SponsorBlock ones
+
+    -- Step 4: keep non-SB chapters that aren't inside a segment (uploader
+    -- chapters inside a segment are the very content we're trying to skip).
     local preserved_chapters = {}
     for _, chapter in ipairs(chapter_list) do
         -- Drop chapters that fall inside a segment (not at boundaries)
@@ -304,84 +323,79 @@ local function merge_segments()
             table.insert(preserved_chapters, chapter)
         end
     end
-    
-    -- Create new chapter list with preserved chapters + SponsorBlock segments
+
+    -- Step 5: rebuild the list from scratch.
     chapter_list = {}
-    
-    -- Add all preserved chapters
+
     for _, chapter in ipairs(preserved_chapters) do
         table.insert(chapter_list, chapter)
     end
-    
-    -- Add SponsorBlock segment chapters
+
+    -- SB boundary chapters: a start chapter per segment, plus an end chapter
+    -- unless a preserved one already lands there (reuse it, don't duplicate).
     local default_title = mp.get_property("media-title") or "no title"
-    
+
     -- Track which preserved chapters we've used as end boundaries (to avoid duplicates)
     local used_preserved_as_end = {}
-    
+
     for _, seg in ipairs(final_segments) do
-        -- Add start chapter
         local start_chapter = {title = "[SponsorBlock]: " .. seg.category, time = seg.start}
         table.insert(chapter_list, start_chapter)
-        
-        -- Add end chapter
-        -- First, check if there's a preserved chapter at the exact end time (within small tolerance)
+
         local end_chapter = nil
         local found_preserved = false
         local small_tol = 0.001
         for i, preserved in ipairs(preserved_chapters) do
             if not used_preserved_as_end[i] and math.abs(preserved.time - seg['end']) <= small_tol then
                 -- Use the preserved chapter as the end boundary - don't create duplicate
-                -- Mark it as used so we don't use it again
                 used_preserved_as_end[i] = true
                 found_preserved = true
-                -- Don't add a duplicate - the preserved chapter is already in chapter_list
                 break
             end
         end
-        
+
         if not found_preserved then
-            -- Create new end chapter and restore title from nearest previous chapter
+            -- No preserved chapter at the boundary: synthesize one, borrowing
+            -- the title of the closest earlier normal chapter so the chapter
+            -- list doesn't suddenly show the media title mid-video.
             end_chapter = {title = default_title, time = seg['end']}
-            
-            -- Find the nearest previous non-SponsorBlock chapter (by time, not array order)
+
             local nearest_chapter = nil
             local nearest_time = -1
-            
-            -- Check already-added chapters in chapter_list
+
             for _, prev in ipairs(chapter_list) do
-                if prev.time < seg['end'] and prev.title and not match_category(prev.title) then
+                if prev.time < seg['end'] and prev.title and not match_cat(prev.title) then
                     if prev.time > nearest_time then
                         nearest_time = prev.time
                         nearest_chapter = prev
                     end
                 end
             end
-            
+
             -- Also check preserved chapters (in case they weren't added yet)
             for _, preserved in ipairs(preserved_chapters) do
-                if preserved.time < seg['end'] and not match_category(preserved.title) then
+                if preserved.time < seg['end'] and not match_cat(preserved.title) then
                     if preserved.time > nearest_time then
                         nearest_time = preserved.time
                         nearest_chapter = preserved
                     end
                 end
             end
-            
+
             if nearest_chapter then
                 end_chapter.title = nearest_chapter.title
             end
-            
+
             table.insert(chapter_list, end_chapter)
         end
     end
-    
-    -- Sort by time
+
     table.sort(chapter_list, function(a, b) return a.time < b.time end)
-    
+
+    -- Step 6: helper used below – are prev/curr the two ends of one segment?
+    -- Those pairs must never be merged, or the segment would collapse to a
+    -- point.
     local function is_segment_boundary(prev, curr)
-        -- Check if these are the start/end of the same segment
-        -- A segment's own start and end should never be merged
         local small_tol = 0.01  -- Small tolerance for floating point comparison
         for _, seg in ipairs(final_segments) do
             if (math.abs(prev.time - seg.start) <= small_tol and math.abs(curr.time - seg['end']) <= small_tol) or
@@ -391,26 +405,27 @@ local function merge_segments()
         end
         return false
     end
-    -- Now merge chapters that are very close together (within tolerance)
-    -- This handles the baked-in vs fresh time differences
-    -- BUT: Don't merge a segment's own start and end chapters
+    -- Final near-duplicate merge. Handles baked-in vs fresh time differences.
+    -- General rule when two chapters land within time_tolerance:
+    --   * an SB chapter wins over a normal one
+    --   * same kind + same title → drop the duplicate
+    --   * never merge a segment's own start/end pair (see above)
     for i = #chapter_list, 2, -1 do
         local curr = chapter_list[i]
         local prev = chapter_list[i - 1]
-        
+
         if math.abs(curr.time - prev.time) <= options.time_tolerance then
-            -- Never merge a segment's own boundaries
             if is_segment_boundary(prev, curr) then
                 -- Keep both chapters - these are start/end of the same segment
-            elseif match_category(curr.title) and not match_category(prev.title) then
+            elseif match_cat(curr.title) and not match_cat(prev.title) then
                 -- Replace prev with curr
                 chapter_list[i - 1] = curr
                 table.remove(chapter_list, i)
-            elseif match_category(prev.title) and not match_category(curr.title) then
+            elseif match_cat(prev.title) and not match_cat(curr.title) then
                 -- Keep prev, remove curr
                 table.remove(chapter_list, i)
-            elseif match_category(curr.title) and match_category(prev.title) then
-                -- Both are SponsorBlock: keep one, remove duplicate (but not if same segment)
+            elseif match_cat(curr.title) and match_cat(prev.title) then
+                -- Both are SponsorBlock: keep one, remove duplicate
                 table.remove(chapter_list, i)
             else
                 -- Both are normal: keep the one with better title or remove duplicate
@@ -420,12 +435,18 @@ local function merge_segments()
             end
         end
     end
-    
-    -- Trace: dump merged chapter list
+
+    -- Refresh the derived segment cache from the new chapter list.
     rebuild_segment_cache()
 end
 
---MARK: actionable segs
+--MARK: Auto-skip
+--
+-- Returns the segment that should be skipped for the given playback position,
+-- or nil. Classification of the segment's category:
+--   • in show_only_cats → mark-only, never skipped (returned nil)
+--   • in categories      → skipped
+--   • unknown            → skipped only if skip_unknown is enabled
 local function get_actionable_segment(start_time, chapter_index)
     local segment
     for i, range in ipairs(segment_cache) do
@@ -436,13 +457,13 @@ local function get_actionable_segment(start_time, chapter_index)
         end
     end
     if not segment then return nil end
-    
-    -- Check if this segment's category is in show_only_cats
+
+    -- Normalize the category the same way the lookup tables were keyed.
     local cat_lower = string.lower(segment.category):gsub('_', ' ')
     if show_only_lookup[cat_lower] then
         msg.debug("Sponsorblock: not skipping mark-only segment: ", segment.category)
         return nil -- Don't skip, just mark
-    elseif cats_lookup[cat_lower] then
+    elseif skip_cats_lookup[cat_lower] then
         mp.osd_message(("[sponsorblock] skipping %s"):format(segment.category), options.show_msg_duration)
         msg.info("Sponsorblock: Skipping chapter:", chapter_index, "(" .. segment.category .. ")")
         return segment -- Should be skipped
@@ -452,87 +473,100 @@ local function get_actionable_segment(start_time, chapter_index)
     end
 end
 
--- Track skip attempts per position for debouncing during seeking
+-- Debounce state: a small ring of recent skip timestamps so the same spot
+-- can't be skipped in a tight loop (e.g. when playback is stuck at a segment
+-- boundary or the user is dragging over it).
 local skip_times = {0, 0, 0, 0, 0}
 local skip_index = 1
 local last_skip_position = -1
 
---MARK: skip current ch
+-- Invoked on every chapter change while enabled. If the chapter's time falls
+-- inside an actionable segment, seeks just past the segment's end.
 local function skip_current_chapter()
-    if not ON then return end
+    if not enabled then return end
 
     local cur_chapter_index = mp.get_property_number("chapter")
     if not cur_chapter_index or cur_chapter_index < 0 then return end
-    
-    -- Use segment_cache which has reliable start/end times
+
+    -- Read the chapter's start time directly (segment_cache only holds
+    -- boundary times, this is the actual playback position we're testing).
     local chapter_time = mp.get_property_number("chapter-list/"..cur_chapter_index.."/time")
     if not chapter_time then return end
 
     local segment = get_actionable_segment(chapter_time, cur_chapter_index)
     if not segment then return end
 
-    -- Debounce: track attempts per position. If the chapter_time hasn't
-    -- meaningfully changed since the last skip, we're likely being held
-    -- in a segment by seek-bar dragging -- debounce after 5 attempts in 0.2s.
-    -- Different chapter positions always skip (normal playback progression).
+    -- Debounce: if we're being asked to skip (nearly) the same position again,
+    -- only allow it if the oldest of the last 5 attempts is >0.2s old –
+    -- i.e. five rapid attempts at one spot are ignored. A genuinely new
+    -- position always skips.
     local now = mp.get_time()
-    
+
     if math.abs(chapter_time - last_skip_position) < 0.5 then
         -- Same position as last skip attempt - debounce check
         skip_times[skip_index] = now
         skip_index = skip_index % 5 + 1
-        
+
         local oldest = skip_times[skip_index]
         if now - oldest < 0.2 then
             return -- Too many rapid attempts at this position, debounce
         end
     end
 
-    -- New position or not debounced - skip it
+    -- New position or not debounced: seek just past the segment end (with a
+    -- small overshoot, and clamped so we can't run past the end of the media).
     last_skip_position = chapter_time
     local skip_to = math.min(segment['end'] + 0.01, duration - 0.1)
     mp.set_property("time-pos", skip_to)
 end
 
---MARK: toggle
+-- Toggles auto-skip. Wired to the forced 'b' keybinding (activate_sponsorblock);
+-- enabling it also starts observing the chapter property, disabling stops it.
 local function toggle()
-    if ON then
+    if enabled then
         msg.info("Turning off sponsorblock")
         mp.unobserve_property(skip_current_chapter)
         mp.osd_message("[sponsorblock] off")
-        ON = false
+        enabled = false
     else
         msg.info("Turning on sponsorblock")
         mp.observe_property("chapter", "number", skip_current_chapter)
         mp.osd_message("[sponsorblock] on")
-        ON = true
+        enabled = true
     end
     update_button()
 end
 
---MARK: activate sponsorblock
+-- Final activation, called from file_loaded and the manual re-pull script
+-- message.
+--   merge truthy  → fresh SponsorBlock data, merge_segments() (YouTube path)
+--   merge falsy   → only nearby-boundary dedup + cache rebuild (local files)
+-- Afterwards the modified chapter list is written back to mpv, the chapter
+-- property is observed, and the forced 'b' keybinding becomes active.
 local function activate_sponsorblock(merge)
     duration = mp.get_property_native("duration") or 0
-    
+
     if merge then
-        -- Merge baked-in chapters with fresh segments from API
         merge_segments()
     else
         merge_nearby_chapters()
         rebuild_segment_cache()
     end
-    
-    -- Write back the updated chapter list
-    mp.set_property_native("chapter-list", chapter_list)
-    mp.commandv('script-message-to', 'uosc', 'refresh')
 
-    ON = true
+    -- Publish the result to mpv.
+    mp.set_property_native("chapter-list", chapter_list)
+
+    enabled = true
     update_button()
     mp.observe_property("chapter", "number", skip_current_chapter)
     mp.add_forced_key_binding("b","sponsorblock", toggle)
 end
 
---MARK: extract yt id
+--MARK: Data fetching
+--
+-- Extracts the 11-character YouTube video ID. Tries the media path first,
+-- then the HTTP Referer header, then PURL metadata – in that order – because
+-- different ytdl_hook setups expose the URL in different places.
 local function extract_youtube_id()
     local video_path = mp.get_property("path", "")
     msg.debug("Sponsorblock: video_path:", video_path)
@@ -547,6 +581,8 @@ local function extract_youtube_id()
         if not id then
             id = purl:match(pattern)
         end
+        -- Some sources (e.g. query strings) append extra data after the ID; a
+        -- real ID is exactly 11 characters, so we truncate.
         if id and #id >= 11 then
             return id:sub(1, 11)
         end
@@ -555,7 +591,10 @@ local function extract_youtube_id()
     return nil
 end
 
---MARK: extract sponsor data
+-- Reads SponsorBlock chapters out of the ytdl_hook subprocess result
+-- (sponsorblock_chapters). Only works when the hook was configured with
+-- sponsorblock-mark=all – see the ytdl-raw-options injection at the bottom of
+-- this file.
 local function extract_sponsorskip_data()
     local json_results = mp.get_property_native("user-data/mpv/ytdl/json-subprocess-result")
     local stdout_value = json_results["stdout"]
@@ -571,32 +610,36 @@ local function extract_sponsorskip_data()
     return true
 end
 
---MARK: pull sponsor data
+-- Fallback: query the SponsorBlock server directly via curl.
+-- The categories parameter includes both skip and mark-only categories so
+-- mark-only segments also show up as chapters (they just never get skipped,
+-- see get_actionable_segment).
+-- Hash mode (options.hash = "true"): instead of the video ID, query
+-- /{first 4 chars of sha256(id)} and match the response entry by videoID.
 local function pull_sponsorskip_data()
     local youtube_id = extract_youtube_id()
     if not youtube_id then return false end
     msg.debug("Sponsorblock: found youtube_id:", youtube_id)
 
-    local categories_str = parsed_categories(options.categories)
+    local cats_str = parsed_cats(options.categories)
     if options.show_only_cats ~= "" then
-        local show_only_str = parsed_categories(options.show_only_cats)
-        categories_str = categories_str ~= "" and (categories_str .. "," .. show_only_str) or show_only_str
+        local show_only_str = parsed_cats(options.show_only_cats)
+        cats_str = cats_str ~= "" and (cats_str .. "," .. show_only_str) or show_only_str
     end
 
-    -- Prepare curl arguments
-    local args = {"curl", "-L", "-s", "-G", "--data-urlencode", ("categories=[%s]"):format(categories_str)}
+    local args = {"curl", "-L", "-s", "-G", "--data-urlencode", ("categories=[%s]"):format(cats_str)}
     local url = options.server
 
-    -- Handle hash functionality
+    -- Hash mode: derive the lookup key from the video ID
     if options.hash == "true" then
-        local sha = mp.command_native{
+        local sha_result = mp.command_native{
             name = "subprocess",
             capture_stdout = true,
             args = {"sha256sum"},
             stdin_data = youtube_id
         }
-        if sha.stdout then
-            url = ("%s/%s"):format(url, sha.stdout:sub(1, 4))
+        if sha_result.stdout then
+            url = ("%s/%s"):format(url, sha_result.stdout:sub(1, 4))
         else
             msg.error("Failed to generate SHA256 hash")
             return false
@@ -607,7 +650,6 @@ local function pull_sponsorskip_data()
     end
     table.insert(args, url)
 
-    -- Fetch sponsor data
     local result = mp.command_native{
         name = "subprocess",
         capture_stdout = true,
@@ -620,7 +662,7 @@ local function pull_sponsorskip_data()
 
     if type(json) ~= "table" then return false end
 
-    -- Handle hash response format
+    -- Hash mode returns a list; pick the entry whose videoID matches.
     if options.hash == "true" then
         for _, i in pairs(json) do
             if i.videoID == youtube_id then
@@ -636,25 +678,28 @@ local function pull_sponsorskip_data()
     end
 end
 
---MARK: file loaded
+--MARK: Entry point
+--
+-- Runs on every file load. Resets all state, then branches on the media:
+--   • local file → usable only if SB chapters are baked in (merge=false)
+--   • YouTube    → ytdl hook result, falling back to a server pull (merge=true)
+--   • anything else → abort
 local function file_loaded()
     msg.debug("Sponsorblock: file_loaded")
-    -- Clean up keybinding from previous video
+    -- Reset everything from the previous media, including the 'b' keybinding.
     mp.remove_key_binding("sponsorblock")
-    -- Reset data
     sponsor_data = nil
-    ON = false
+    enabled = false
     segment_cache = {}
     num_seg_found = nil
     hide_button()
     duration = mp.get_property_native("duration") or 0
-    -- Get existing chapters
     chapter_list = mp.get_property_native("chapter-list", {})
     if is_local_file() then
         msg.debug("Sponsorblock: Local file detected, trying to extract segments from local file")
-        local function hit()
+        local function find_baked_cat()
             for i, chapter in ipairs(chapter_list) do
-                local category = match_category(chapter.title)
+                local category = match_cat(chapter.title)
                 if category then
                     msg.debug("Sponsorblock: found local chapter", i, chapter.title)
                     return category
@@ -662,7 +707,9 @@ local function file_loaded()
             end
         end
 
-        if hit() then
+        -- Local files have no server data source: either the file carries SB
+        -- chapters or there's nothing to do.
+        if find_baked_cat() then
             msg.info("Sponsorblock: Using local segments")
             activate_sponsorblock(false)
             return
@@ -686,17 +733,22 @@ local function file_loaded()
         return
     end
     msg.info("Sponsorblock: blockable chapters found, engaging Skipdrive")
-    -- Activate (will merge with existing chapters)
+    -- Fresh data (YouTube path): merge it into the existing chapters.
     activate_sponsorblock(true)
 end
 
---MARK: Register
+--MARK: Registration
 mp.register_event("file-loaded", file_loaded)
 
+-- Script message: re-pulls data on demand:
+--   • local file with baked-in SB chapters → fresh server data replaces the
+--     old segments (merge_segments wipes the existing SB chapters first).
+--     The video ID must be in the path (e.g. [videoid].ext).
+--   • YouTube stream that loaded before any sponsor data existed (fresh
+--     release) → pull again once the data exists.
 mp.register_script_message('manual_sponsorblock_pull', function()
-    -- Reset data
     sponsor_data = nil
-    ON = false
+    enabled = false
     segment_cache = {}
     num_seg_found = nil
     msg.info("Sponsorblock: Manual trigger to pull data from server")
@@ -705,14 +757,14 @@ mp.register_script_message('manual_sponsorblock_pull', function()
         msg.debug("Sponsorblock: Failed to pull data from server (or no data for the video found), aborting")
         return
     end
-    activate_sponsorblock()
+    activate_sponsorblock(true)
 end)
 
--- Always enable sponsorblock-mark for ytdl hook
+-- Tell ytdl_hook to emit SponsorBlock chapters (sponsorblock-mark=all) in its
+-- subprocess result; extract_sponsorskip_data() reads them from there.
 local opts = mp.get_property_native("ytdl-raw-options") or {}
 opts["sponsorblock-mark"] = "all"
 mp.set_property_native("ytdl-raw-options", opts)
 
--- hide on init (for idle)
+-- Clear the button on script init so it's not shown over the idle screen.
 hide_button()
-
