@@ -45,7 +45,7 @@ local options = {
     skip_unknown = false,
     min_segment_length = 1,
     time_tolerance = 0.1, -- Used for segment boundary checks and chapter time matching
-    nearby_merge_tolerance = 2, -- Tolerance for merge_nearby_chapters (deduping close chapters in local files)
+    nearby_merge_tolerance = 2, -- Tolerance for folding nearby chapters into segment boundaries
     use_curl_fallback = true,
 }
 
@@ -185,87 +185,47 @@ end
 
 --MARK: Chapter merging
 --
--- Local files only: dedupes chapters that landed within
--- nearby_merge_tolerance of each other (e.g. re-encoded chapters drifted a
--- fraction of a second). The tricky bit is an SB chapter sitting next to a
--- normal one: if the chapter *after* the SB one is SB as well, the SB chapter
--- is a segment START (keep it, drop the normal neighbor); otherwise it's a
--- segment END marker, which is dropped so the boundary folds into the normal
--- chapter.
-local function merge_nearby_chapters()
-    table.sort(chapter_list, function(a, b) return a.time < b.time end)
+-- One merge function for both local and YouTube paths, implementing the
+-- original "subsume" semantics: a normal chapter that lands within
+-- nearby_merge_tolerance of a segment boundary is folded into that boundary
+-- instead of producing a duplicate adjacent chapter.
+--   * start: the nearby normal is replaced by the SB start chapter (which
+--            keeps the SB time, so the segment cache / skip logic stays
+--            accurate); the replaced title is carried over to the segment's
+--            end chapter.
+--   * end:   the normal nearest the segment end becomes that end (kept at its
+--            own time); no separate end chapter is synthesized, and any other
+--            normal clustering within tolerance of the same end is dropped as
+--            a drift duplicate.
+--   * else:  the end is synthesized at the segment end, borrowing the nearest
+--            earlier normal title (fallback: the media title).
 
-    for i = #chapter_list, 2, -1 do
-        local curr = chapter_list[i]
-        local prev = chapter_list[i - 1]
-        if math.abs(curr.time - prev.time) <= options.nearby_merge_tolerance then
-            -- Both are SponsorBlock: keep both (distinct segment boundaries)
-            if match_cat(curr.title) and match_cat(prev.title) then
-                -- Do nothing: both are segment boundaries, keep them
-            -- SB + normal (SB is curr): remove SB if it's a segment END
-            elseif match_cat(curr.title) and not match_cat(prev.title) then
-                if match_cat(chapter_list[i + 1] and chapter_list[i + 1].title) then
-                    -- curr is segment START: keep it, remove normal prev
-                    table.remove(chapter_list, i - 1)
-                else
-                    -- curr is segment END: remove it (subsume into normal)
-                    table.remove(chapter_list, i)
-                end
-            -- Normal + SB (normal is curr, SB is prev): keep both
-            -- (normal chapter after SB should not be subsumed into SB boundary)
-            elseif not match_cat(curr.title) and match_cat(prev.title) then
-                -- Do nothing: keep both chapters
-            -- Both normal: remove duplicate
-            else
-                if curr.title == prev.title then
-                    table.remove(chapter_list, i)
-                end
+-- Derive segments from the SB chapters already baked into a local file: each
+-- "[SponsorBlock]:" chapter starts a segment and the *next* chapter's time is
+-- that segment's end (or the end of the file for the last chapter).
+local function build_segments_local()
+    local segs = {}
+    for i, ch in ipairs(chapter_list) do
+        local cat = match_cat(ch.title)
+        if cat then
+            local next_ch = chapter_list[i + 1]
+            local end_t = next_ch and next_ch.time or duration - 0.001
+            if end_t > ch.time then
+                table.insert(segs, {start = ch.time, ['end'] = end_t, category = cat})
             end
         end
     end
+    return segs
 end
--- Merges freshly fetched SponsorBlock segments (sponsor_data) into the
--- existing chapter list.
---
--- Pipeline:
---   1. clear old SB chapters from the list
---   2. build fresh segments from sponsor_data (drop malformed entries and
---      anything shorter than min_segment_length)
---   3. dedupe near-identical segments, then resolve overlaps by keeping the
---      wider segment
---   4. preserve non-SB chapters that fall *outside* the segments – dropping
---      ones inside them, because those are usually the uploader's own
---      "sponsor" chapters
---   5. rebuild the list: preserved chapters + SB boundary chapters; a
---      preserved chapter that already sits on a segment end is reused as that
---      boundary instead of being duplicated
---   6. sort and do a final near-duplicate merge, which must never merge a
---      segment's own start/end pair
-local function merge_segments()
-    -- Wipe previously created SB chapters so this run's merge is the only one
-    -- (also covers the case where local ones were present before a manual
-    -- re-pull).
-    for i, chapter in ipairs(chapter_list) do
-        local category = match_cat(chapter.title)
-        if category then
-            table.remove(chapter_list, i)
-        end
-    end
 
-    if not sponsor_data then return end
-
-    msg.debug("Sponsorblock: sponsor_data:", utils.to_string(sponsor_data))
-
-    -- Step 2: normalize API segments (category lowercased, underscores →
-    -- spaces, so it matches the lookup tables' keys).
-    local fresh_segments = {}
+-- Build normalized, deduped, overlap-resolved segments from fresh sponsor_data.
+local function build_segments_data()
+    if not sponsor_data then return {} end
+    local segs = {}
     for _, segment in pairs(sponsor_data) do
-        if not segment.segment or not segment.segment[1] or not segment.segment[2] then
-            msg.debug("Sponsorblock: skipping invalid segment entry:", segment)
-        else
-            local delta = segment.segment[2] - segment.segment[1]
-            if delta > options.min_segment_length then
-                table.insert(fresh_segments, {
+        if segment.segment and segment.segment[1] and segment.segment[2] then
+            if segment.segment[2] - segment.segment[1] > options.min_segment_length then
+                table.insert(segs, {
                     start = segment.segment[1],
                     ['end'] = segment.segment[2],
                     category = string.lower(segment.category):gsub('_', ' '),
@@ -273,170 +233,132 @@ local function merge_segments()
             end
         end
     end
-
-    -- Step 3a: drop exact duplicates (within 0.5s on both ends).
-    for i = #fresh_segments, 2, -1 do
+    -- Drop near-identical duplicates (within 0.5s on both ends).
+    for i = #segs, 2, -1 do
         for j = i - 1, 1, -1 do
-            if math.abs(fresh_segments[i].start - fresh_segments[j].start) <= 0.5 and
-               math.abs(fresh_segments[i]['end'] - fresh_segments[j]['end']) <= 0.5 then
-                table.remove(fresh_segments, i)
+            if math.abs(segs[i].start - segs[j].start) <= 0.5 and
+               math.abs(segs[i]['end'] - segs[j]['end']) <= 0.5 then
+                table.remove(segs, i)
                 break
             end
         end
     end
-
-    table.sort(fresh_segments, function(a, b) return a.start < b.start end)
-
-    -- Step 3b: overlapping segments – keep the wider one.
-    local final_segments = {}
-    for _, seg in ipairs(fresh_segments) do
-        if #final_segments == 0 then
-            table.insert(final_segments, seg)
+    table.sort(segs, function(a, b) return a.start < b.start end)
+    -- Overlapping segments: keep the wider one.
+    local out = {}
+    for _, seg in ipairs(segs) do
+        if #out == 0 then
+            table.insert(out, seg)
         else
-            local last = final_segments[#final_segments]
+            local last = out[#out]
             if seg.start < last['end'] then
                 if seg['end'] - seg.start > last['end'] - last.start then
-                    final_segments[#final_segments] = seg
+                    out[#out] = seg
                 end
             else
-                table.insert(final_segments, seg)
+                table.insert(out, seg)
             end
         end
     end
+    return out
+end
 
-    -- Step 4: keep non-SB chapters that aren't inside a segment (uploader
-    -- chapters inside a segment are the very content we're trying to skip).
-    local preserved_chapters = {}
-    for _, chapter in ipairs(chapter_list) do
-        -- Drop chapters that fall inside a segment (not at boundaries)
-        -- avoids leftover uploader chapters marking sponsor/ad content
-        local inside_segment = false
-        for _, seg in ipairs(final_segments) do
-            if chapter.time > seg.start + options.time_tolerance and
-               chapter.time < seg['end'] - options.time_tolerance then
-                inside_segment = true
-                msg.debug("Sponsorblock: inside segment found, assuming youtuber marked sponsor/add chapter:", chapter.title)
-                break
-            end
-        end
-        if not inside_segment then
-            table.insert(preserved_chapters, chapter)
+-- The unified merge. Rebuilds chapter_list from the non-SB chapters and the
+-- given segments, subsuming nearby chapters into the segment boundaries.
+local function merge_chapters(final_segments)
+    -- The non-SB chapters are the base the segments fold into.
+    local normals = {}
+    for _, ch in ipairs(chapter_list) do
+        if not match_cat(ch.title) then
+            table.insert(normals, ch)
         end
     end
+    table.sort(normals, function(a, b) return a.time < b.time end)
 
-    -- Step 5: rebuild the list from scratch.
-    chapter_list = {}
-
-    for _, chapter in ipairs(preserved_chapters) do
-        table.insert(chapter_list, chapter)
-    end
-
-    -- SB boundary chapters: a start chapter per segment, plus an end chapter
-    -- unless a preserved one already lands there (reuse it, don't duplicate).
+    local tol = options.nearby_merge_tolerance
     local default_title = mp.get_property("media-title") or "no title"
+    local used = {}        -- index into normals: true = consumed/dropped
+    local boundaries = {}  -- SB start + end chapters created here
 
-    -- Track which preserved chapters we've used as end boundaries (to avoid duplicates)
-    local used_preserved_as_end = {}
+    -- Nearest unconsumed normal within tol of t (index, or nil).
+    local function nearest_normal(t)
+        local best_i, best_d
+        for i, ch in ipairs(normals) do
+            if not used[i] then
+                local d = math.abs(ch.time - t)
+                if d <= tol and (not best_i or d < best_d) then
+                    best_i, best_d = i, d
+                end
+            end
+        end
+        return best_i
+    end
 
     for _, seg in ipairs(final_segments) do
-        local start_chapter = {title = "[SponsorBlock]: " .. seg.category, time = seg.start}
-        table.insert(chapter_list, start_chapter)
+        local end_title
 
-        local end_chapter = nil
-        local found_preserved = false
-        local small_tol = 0.001
-        for i, preserved in ipairs(preserved_chapters) do
-            if not used_preserved_as_end[i] and math.abs(preserved.time - seg['end']) <= small_tol then
-                -- Use the preserved chapter as the end boundary - don't create duplicate
-                used_preserved_as_end[i] = true
-                found_preserved = true
-                break
-            end
+        -- START: fold a nearby normal into the SB start (SB keeps its time).
+        local s_i = nearest_normal(seg.start)
+        if s_i then
+            used[s_i] = true
+            end_title = normals[s_i].title  -- carry the replaced title to the end
         end
+        table.insert(boundaries, {title = "[SponsorBlock]: " .. seg.category, time = seg.start})
 
-        if not found_preserved then
-            -- No preserved chapter at the boundary: synthesize one, borrowing
-            -- the title of the closest earlier normal chapter so the chapter
-            -- list doesn't suddenly show the media title mid-video.
-            end_chapter = {title = default_title, time = seg['end']}
-
-            local nearest_chapter = nil
-            local nearest_time = -1
-
-            for _, prev in ipairs(chapter_list) do
-                if prev.time < seg['end'] and prev.title and not match_cat(prev.title) then
-                    if prev.time > nearest_time then
-                        nearest_time = prev.time
-                        nearest_chapter = prev
+        -- END: the normal nearest the end becomes it; drop the rest of the cluster.
+        local e_i = nearest_normal(seg['end'])
+        if e_i then
+            used[e_i] = true
+            table.insert(boundaries, {title = end_title or normals[e_i].title, time = normals[e_i].time})
+            for i, ch in ipairs(normals) do
+                if not used[i] and math.abs(ch.time - seg['end']) <= tol then
+                    used[i] = true
+                end
+            end
+        else
+            -- No normal at the end: synthesize one, borrowing a nearby title.
+            local title = end_title or default_title
+            local best
+            for i, ch in ipairs(normals) do
+                if ch.time < seg['end'] then
+                    if not best or ch.time > best.time then
+                        best = ch
                     end
                 end
             end
-
-            -- Also check preserved chapters (in case they weren't added yet)
-            for _, preserved in ipairs(preserved_chapters) do
-                if preserved.time < seg['end'] and not match_cat(preserved.title) then
-                    if preserved.time > nearest_time then
-                        nearest_time = preserved.time
-                        nearest_chapter = preserved
-                    end
+            if best and not end_title then
+                title = best.title
+            end
+            table.insert(boundaries, {title = title, time = seg['end']})
+        end
+    end
+    -- Drop normals that fall strictly inside a segment: these are the
+    -- uploader's own "sponsor"/"ad" chapters, redundant with the SB
+    -- boundary (documented behavior). Fold already consumed near-boundary
+    -- normals within nearby_merge_tolerance; this clears the interior.
+    for i, ch in ipairs(normals) do
+        if not used[i] then
+            for _, seg in ipairs(final_segments) do
+                if ch.time > seg.start + options.time_tolerance and ch.time < seg['end'] - options.time_tolerance then
+                    used[i] = true
+                    break
                 end
             end
-
-            if nearest_chapter then
-                end_chapter.title = nearest_chapter.title
-            end
-
-            table.insert(chapter_list, end_chapter)
         end
     end
 
+    -- Compose: remaining normals + boundary chapters, sorted by time.
+    chapter_list = {}
+    for i, ch in ipairs(normals) do
+        if not used[i] then
+            table.insert(chapter_list, ch)
+        end
+    end
+    for _, b in ipairs(boundaries) do
+        table.insert(chapter_list, b)
+    end
     table.sort(chapter_list, function(a, b) return a.time < b.time end)
 
-    -- Step 6: helper used below – are prev/curr the two ends of one segment?
-    -- Those pairs must never be merged, or the segment would collapse to a
-    -- point.
-    local function is_segment_boundary(prev, curr)
-        local small_tol = 0.01  -- Small tolerance for floating point comparison
-        for _, seg in ipairs(final_segments) do
-            if (math.abs(prev.time - seg.start) <= small_tol and math.abs(curr.time - seg['end']) <= small_tol) or
-               (math.abs(curr.time - seg.start) <= small_tol and math.abs(prev.time - seg['end']) <= small_tol) then
-                return true
-            end
-        end
-        return false
-    end
-    -- Final near-duplicate merge. Handles baked-in vs fresh time differences.
-    -- General rule when two chapters land within time_tolerance:
-    --   * an SB chapter wins over a normal one
-    --   * same kind + same title → drop the duplicate
-    --   * never merge a segment's own start/end pair (see above)
-    for i = #chapter_list, 2, -1 do
-        local curr = chapter_list[i]
-        local prev = chapter_list[i - 1]
-
-        if math.abs(curr.time - prev.time) <= options.time_tolerance then
-            if is_segment_boundary(prev, curr) then
-                -- Keep both chapters - these are start/end of the same segment
-            elseif match_cat(curr.title) and not match_cat(prev.title) then
-                -- Replace prev with curr
-                chapter_list[i - 1] = curr
-                table.remove(chapter_list, i)
-            elseif match_cat(prev.title) and not match_cat(curr.title) then
-                -- Keep prev, remove curr
-                table.remove(chapter_list, i)
-            elseif match_cat(curr.title) and match_cat(prev.title) then
-                -- Both are SponsorBlock: keep one, remove duplicate
-                table.remove(chapter_list, i)
-            else
-                -- Both are normal: keep the one with better title or remove duplicate
-                if curr.title == prev.title then
-                    table.remove(chapter_list, i)
-                end
-            end
-        end
-    end
-
-    -- Refresh the derived segment cache from the new chapter list.
     rebuild_segment_cache()
 end
 
@@ -539,19 +461,20 @@ end
 
 -- Final activation, called from file_loaded and the manual re-pull script
 -- message.
---   merge truthy  → fresh SponsorBlock data, merge_segments() (YouTube path)
---   merge falsy   → only nearby-boundary dedup + cache rebuild (local files)
+--   merge truthy  → build segments from fresh sponsor_data (YouTube path)
+--   merge falsy   → derive segments from the SB chapters already in the file (local)
 -- Afterwards the modified chapter list is written back to mpv, the chapter
 -- property is observed, and the forced 'b' keybinding becomes active.
 local function activate_sponsorblock(merge)
     duration = mp.get_property_native("duration") or 0
 
+    local segments
     if merge then
-        merge_segments()
+        segments = build_segments_data()
     else
-        merge_nearby_chapters()
-        rebuild_segment_cache()
+        segments = build_segments_local()
     end
+    merge_chapters(segments)
 
     -- Publish the result to mpv.
     mp.set_property_native("chapter-list", chapter_list)
@@ -742,7 +665,7 @@ mp.register_event("file-loaded", file_loaded)
 
 -- Script message: re-pulls data on demand:
 --   • local file with baked-in SB chapters → fresh server data replaces the
---     old segments (merge_segments wipes the existing SB chapters first).
+--     old segments (SB chapters are rebuilt from the fresh data).
 --     The video ID must be in the path (e.g. [videoid].ext).
 --   • YouTube stream that loaded before any sponsor data existed (fresh
 --     release) → pull again once the data exists.
