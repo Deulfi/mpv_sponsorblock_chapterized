@@ -520,6 +520,7 @@ end
 -- this file.
 local function extract_sponsorskip_data()
     local json_results = mp.get_property_native("user-data/mpv/ytdl/json-subprocess-result")
+    if not json_results then return false end
     local stdout_value = json_results["stdout"]
     local raw_data = utils.parse_json(stdout_value)["sponsorblock_chapters"]
     if not raw_data then return false end
