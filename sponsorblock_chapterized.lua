@@ -237,7 +237,7 @@ local function build_segments_data()
     for i = #segs, 2, -1 do
         for j = i - 1, 1, -1 do
             if math.abs(segs[i].start - segs[j].start) <= 0.5 and
-               math.abs(segs[i]['end'] - segs[j]['end']) <= 0.5 then
+               math.abs(segs[i]['end'] - segs[j]['end']) < 0.5 then
                 table.remove(segs, i)
                 break
             end
@@ -578,7 +578,6 @@ local function pull_sponsorskip_data()
         name = "subprocess",
         capture_stdout = true,
         playback_only = false,
-        timeout = 10,
         args = args,
     }
     if not result or not result.stdout then return false end
@@ -596,7 +595,7 @@ local function pull_sponsorskip_data()
         end
         return false
     else
-        if not json[1] or json[1] == "No valid categories provided." then return false end
+        if not json[1] or json[1] == "No valid categories provided" then return false end
         sponsor_data = json
         return true
     end
@@ -671,16 +670,14 @@ mp.register_event("file-loaded", file_loaded)
 --   • YouTube stream that loaded before any sponsor data existed (fresh
 --     release) → pull again once the data exists.
 mp.register_script_message('manual_sponsorblock_pull', function()
-    sponsor_data = nil
-    enabled = false
-    segment_cache = {}
-    num_seg_found = nil
     msg.info("Sponsorblock: Manual trigger to pull data from server")
     local result = pull_sponsorskip_data()
     if not result then
         msg.debug("Sponsorblock: Failed to pull data from server (or no data for the video found), aborting")
+        mp.osd_message("[sponsorblock] pull failed", options.show_msg_duration)
         return
     end
+    mp.osd_message("[sponsorblock] data pulled", options.show_msg_duration)
     activate_sponsorblock(true)
 end)
 
